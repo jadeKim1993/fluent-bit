@@ -35,7 +35,9 @@
 
 /*
  * CSV field parser, implementing (most of) RFC 4180: double-quoted fields,
- * "" as an escaped double quote, and comma as the sole delimiter. Since
+ * "" as an escaped double quote, and a configurable single-character field
+ * delimiter (comma by default, see 'csv_delimiter'; the quote character
+ * itself is always '"' regardless of the delimiter). Since
  * flb_parser_do() always receives a single, already delimited record with
  * no guaranteed trailing line terminator (callers usually strip it before
  * invoking the parser), embedded newlines inside quoted fields are not
@@ -108,7 +110,7 @@ static int csv_field_buf_grow(struct csv_field_buf *fb)
  * number of fields found, or (size_t) -1 on allocation failure while
  * growing the field buffer.
  */
-static size_t csv_split_record(const char *buf, size_t len,
+static size_t csv_split_record(const char *buf, size_t len, char delim,
                                struct csv_field_buf *fb)
 {
     size_t pos = 0;
@@ -145,7 +147,7 @@ static size_t csv_split_record(const char *buf, size_t len,
                 pos++;
             }
             count++;
-            if (pos < len && buf[pos] == ',') {
+            if (pos < len && buf[pos] == delim) {
                 pos++;
                 continue;
             }
@@ -153,14 +155,14 @@ static size_t csv_split_record(const char *buf, size_t len,
         }
         else {
             f->pos = pos;
-            while (pos < len && buf[pos] != ',') {
+            while (pos < len && buf[pos] != delim) {
                 pos++;
             }
             f->len = pos - f->pos;
             count++;
             if (pos < len) {
-                /* skip comma; a trailing comma implies one more (empty)
-                 * field, handled by the next loop iteration */
+                /* skip delimiter; a trailing delimiter implies one more
+                 * (empty) field, handled by the next loop iteration */
                 pos++;
                 continue;
             }
@@ -220,6 +222,14 @@ static int csv_pack_value(msgpack_packer *pck, const char *buf,
         flb_free(out_buf);
     }
     return 0;
+}
+
+void flb_parser_csv_set_delimiter(struct flb_parser *parser, char delimiter)
+{
+    if (delimiter == '\0') {
+        return;
+    }
+    parser->csv_delimiter = delimiter;
 }
 
 void flb_parser_csv_resolve_time_field(struct flb_parser *parser)
@@ -323,7 +333,7 @@ int flb_parser_csv_do(struct flb_parser *parser,
     fb.cap = FLB_PARSER_CSV_STATIC_FIELDS;
     fb.heap = false;
 
-    field_count = csv_split_record(in_buf, in_size, &fb);
+    field_count = csv_split_record(in_buf, in_size, parser->csv_delimiter, &fb);
     if (field_count == (size_t) -1) {
         return -1;
     }

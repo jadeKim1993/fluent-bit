@@ -179,6 +179,42 @@ void test_basic()
     flb_config_exit(config);
 }
 
+void test_custom_delimiter()
+{
+    struct flb_parser *parser = NULL;
+    struct flb_config *config = NULL;
+    int ret;
+    char *input = "a;b;c,d";
+    void *out_buf = NULL;
+    size_t out_size = 0;
+    struct flb_time out_time;
+    char *expected_strs[] = { "0", "a", "1", "b", "2", "c,d" };
+    struct str_list expected = { sizeof(expected_strs) / sizeof(char *), expected_strs };
+
+    config = flb_config_init();
+    TEST_CHECK(config != NULL);
+
+    parser = flb_parser_create("csv", "csv", NULL, FLB_FALSE, NULL, NULL, NULL,
+                               FLB_FALSE, FLB_FALSE, FLB_FALSE, FLB_FALSE,
+                               NULL, 0, NULL, config);
+    TEST_CHECK(parser != NULL);
+
+    flb_parser_csv_set_delimiter(parser, ';');
+
+    /* a literal comma must now be treated as ordinary field content */
+    ret = flb_parser_do(parser, input, strlen(input), &out_buf, &out_size, &out_time);
+    if (!TEST_CHECK(ret != -1)) {
+        TEST_MSG("flb_parser_do failed");
+    }
+    else {
+        compare_msgpack(out_buf, out_size, &expected);
+        flb_free(out_buf);
+    }
+
+    flb_parser_destroy(parser);
+    flb_config_exit(config);
+}
+
 void test_trailing_empty_field()
 {
     struct flb_parser *parser = NULL;
@@ -462,6 +498,7 @@ void test_types()
 
 TEST_LIST = {
     { "basic", test_basic},
+    { "custom_delimiter", test_custom_delimiter},
     { "trailing_empty_field", test_trailing_empty_field},
     { "quoted_fields", test_quoted_fields},
     { "named_fields", test_named_fields},

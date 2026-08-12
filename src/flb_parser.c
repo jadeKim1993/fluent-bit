@@ -1054,6 +1054,7 @@ struct flb_parser *flb_parser_create_with_time_zone(const char *name,
     p->types = types;
     p->types_len = types_len;
     p->csv_time_field_index = -1;
+    p->csv_delimiter = ',';
     if (p->type == FLB_PARSER_CSV) {
         flb_parser_csv_resolve_time_field(p);
     }
@@ -1298,6 +1299,7 @@ int flb_parser_load_parser_definitions(const char *cfg, struct flb_cf *cf,
     flb_sds_t time_zone;
     flb_sds_t types_str;
     flb_sds_t csv_fields_str;
+    flb_sds_t csv_delimiter_str;
     flb_sds_t tmp_str;
     int skip_empty;
     int time_keep;
@@ -1322,6 +1324,7 @@ int flb_parser_load_parser_definitions(const char *cfg, struct flb_cf *cf,
         time_zone = NULL;
         types_str = NULL;
         csv_fields_str = NULL;
+        csv_delimiter_str = NULL;
         tmp_str = NULL;
 
         /* retrieve the section context */
@@ -1413,6 +1416,9 @@ int flb_parser_load_parser_definitions(const char *cfg, struct flb_cf *cf,
         /* csv_fields (only meaningful for 'format csv', comma separated names) */
         csv_fields_str = get_parser_key(config, cf, s, "csv_fields");
 
+        /* csv_delimiter (only meaningful for 'format csv', single character) */
+        csv_delimiter_str = get_parser_key(config, cf, s, "csv_delimiter");
+
         /* Decoders */
         decoders = flb_parser_decoder_list_create(s);
 
@@ -1426,6 +1432,15 @@ int flb_parser_load_parser_definitions(const char *cfg, struct flb_cf *cf,
         }
 
         if (parser->type == FLB_PARSER_CSV) {
+            if (csv_delimiter_str) {
+                if (flb_sds_len(csv_delimiter_str) != 1) {
+                    flb_error("[parser:%s] 'csv_delimiter' must be a single "
+                              "character", name);
+                    goto fconf_error;
+                }
+                flb_parser_csv_set_delimiter(parser, csv_delimiter_str[0]);
+            }
+
             if (csv_fields_str) {
                 if (proc_csv_fields_str(parser, csv_fields_str) == -1) {
                     goto fconf_error;
@@ -1460,6 +1475,9 @@ int flb_parser_load_parser_definitions(const char *cfg, struct flb_cf *cf,
         }
         if (csv_fields_str) {
             flb_sds_destroy(csv_fields_str);
+        }
+        if (csv_delimiter_str) {
+            flb_sds_destroy(csv_delimiter_str);
         }
         if (types_str) {
             flb_sds_destroy(types_str);
@@ -1505,6 +1523,9 @@ int flb_parser_load_parser_definitions(const char *cfg, struct flb_cf *cf,
     }
     if (csv_fields_str) {
         flb_sds_destroy(csv_fields_str);
+    }
+    if (csv_delimiter_str) {
+        flb_sds_destroy(csv_delimiter_str);
     }
     if (types_len) {
         for (i=0; i<types_len; i++){

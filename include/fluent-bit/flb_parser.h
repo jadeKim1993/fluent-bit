@@ -74,6 +74,7 @@ struct flb_parser {
     int csv_field_names_len;
     int csv_time_field_index; /* -1 if unset, else 0-based index of the
                                 * field holding the record timestamp */
+    char csv_delimiter;       /* field delimiter, defaults to ',' */
 };
 
 enum {
@@ -144,6 +145,7 @@ struct flb_parser *flb_parser_get(const char *name, struct flb_config *config);
 int flb_parser_csv_set_fields(struct flb_parser *parser,
                               char **fields, int fields_len);
 void flb_parser_csv_resolve_time_field(struct flb_parser *parser);
+void flb_parser_csv_set_delimiter(struct flb_parser *parser, char delimiter);
 int flb_parser_do(struct flb_parser *parser, const char *buf, size_t length,
                   void **out_buf, size_t *out_size, struct flb_time *out_time);
 
