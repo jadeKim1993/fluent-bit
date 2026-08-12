@@ -46,11 +46,16 @@
  *
  * This is a single left-to-right pass over the input buffer: it never
  * copies or rescans bytes to find field boundaries, it only records
- * (offset, length) pairs into the caller's buffer. A second, position-only
- * pass fills the msgpack map once the total field count (and therefore the
- * map header) is known. Unescaping ("" -> ") is only performed for the
- * (uncommon) fields that actually contain an embedded quote, and reuses a
- * small stack buffer unless the field is unusually large.
+ * (offset, length) pairs into the caller's buffer. A counting pass over
+ * those positions then determines the final map size (see csv_field_skip)
+ * before a third, position-only pass fills the msgpack map. Unescaping
+ * ("" -> ") is only performed for the (uncommon) fields that actually
+ * contain an embedded quote, and reuses a small stack buffer unless the
+ * field is unusually large.
+ *
+ * A field never produces a key in the output when its value is empty
+ * (consecutive delimiters, e.g. "a,,c") or when the record has more
+ * columns than a configured 'csv_fields' defines - see csv_field_skip().
  */
 
 /* Fields are tracked on the stack up to this count before falling back to
@@ -186,6 +191,28 @@ static size_t csv_unescape(const char *src, size_t len, char *dst)
         dst[out++] = src[in++];
     }
     return out;
+}
+
+/*
+ * A field is dropped entirely (no key is emitted) when:
+ *  - it is the time field and time_keep is off,
+ *  - 'csv_fields' is set and the record has more columns than it defines,
+ *  - the value is empty (e.g. consecutive delimiters, or a delimiter at
+ *    the very start/end of the record).
+ */
+static bool csv_field_skip(struct flb_parser *parser, struct csv_field_buf *fb,
+                           int time_idx, bool exclude_time_field, size_t i)
+{
+    if (exclude_time_field && i == (size_t) time_idx) {
+        return true;
+    }
+    if (parser->csv_field_names && i >= (size_t) parser->csv_field_names_len) {
+        return true;
+    }
+    if (fb->fields[i].len == 0) {
+        return true;
+    }
+    return false;
 }
 
 static int csv_pack_value(msgpack_packer *pck, const char *buf,
@@ -359,20 +386,26 @@ int flb_parser_csv_do(struct flb_parser *parser,
     }
 
     exclude_time_field = have_time && !parser->time_keep;
-    map_size = field_count - (exclude_time_field ? 1 : 0);
+
+    map_size = 0;
+    for (i = 0; i < field_count; i++) {
+        if (!csv_field_skip(parser, &fb, time_idx, exclude_time_field, i)) {
+            map_size++;
+        }
+    }
 
     msgpack_sbuffer_init(&tmp_sbuf);
     msgpack_packer_init(&tmp_pck, &tmp_sbuf, msgpack_sbuffer_write);
     msgpack_pack_map(&tmp_pck, map_size);
 
     for (i = 0; i < field_count; i++) {
-        if (exclude_time_field && i == (size_t) time_idx) {
+        if (csv_field_skip(parser, &fb, time_idx, exclude_time_field, i)) {
             continue;
         }
 
         f = &fb.fields[i];
 
-        if (parser->csv_field_names && i < (size_t) parser->csv_field_names_len) {
+        if (parser->csv_field_names) {
             key = parser->csv_field_names[i];
             key_len = strlen(key);
         }

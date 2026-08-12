@@ -215,6 +215,8 @@ void test_custom_delimiter()
     flb_config_exit(config);
 }
 
+/* A trailing delimiter implies one more (empty) field, which must be
+ * dropped rather than emitted as an empty-string value */
 void test_trailing_empty_field()
 {
     struct flb_parser *parser = NULL;
@@ -224,7 +226,7 @@ void test_trailing_empty_field()
     void *out_buf = NULL;
     size_t out_size = 0;
     struct flb_time out_time;
-    char *expected_strs[] = { "0", "a", "1", "b", "2", "" };
+    char *expected_strs[] = { "0", "a", "1", "b" };
     struct str_list expected = { sizeof(expected_strs) / sizeof(char *), expected_strs };
 
     config = flb_config_init();
@@ -234,6 +236,81 @@ void test_trailing_empty_field()
                                FLB_FALSE, FLB_FALSE, FLB_FALSE, FLB_FALSE,
                                NULL, 0, NULL, config);
     TEST_CHECK(parser != NULL);
+
+    ret = flb_parser_do(parser, input, strlen(input), &out_buf, &out_size, &out_time);
+    if (!TEST_CHECK(ret != -1)) {
+        TEST_MSG("flb_parser_do failed");
+    }
+    else {
+        compare_msgpack(out_buf, out_size, &expected);
+        flb_free(out_buf);
+    }
+
+    flb_parser_destroy(parser);
+    flb_config_exit(config);
+}
+
+/* Consecutive delimiters ("a,,c") produce an empty middle field, which
+ * must be dropped instead of emitted with an empty-string value */
+void test_empty_value_dropped()
+{
+    struct flb_parser *parser = NULL;
+    struct flb_config *config = NULL;
+    int ret;
+    char *input = "a,,c";
+    void *out_buf = NULL;
+    size_t out_size = 0;
+    struct flb_time out_time;
+    char *expected_strs[] = { "0", "a", "2", "c" };
+    struct str_list expected = { sizeof(expected_strs) / sizeof(char *), expected_strs };
+
+    config = flb_config_init();
+    TEST_CHECK(config != NULL);
+
+    parser = flb_parser_create("csv", "csv", NULL, FLB_FALSE, NULL, NULL, NULL,
+                               FLB_FALSE, FLB_FALSE, FLB_FALSE, FLB_FALSE,
+                               NULL, 0, NULL, config);
+    TEST_CHECK(parser != NULL);
+
+    ret = flb_parser_do(parser, input, strlen(input), &out_buf, &out_size, &out_time);
+    if (!TEST_CHECK(ret != -1)) {
+        TEST_MSG("flb_parser_do failed");
+    }
+    else {
+        compare_msgpack(out_buf, out_size, &expected);
+        flb_free(out_buf);
+    }
+
+    flb_parser_destroy(parser);
+    flb_config_exit(config);
+}
+
+/* When 'csv_fields' defines fewer columns than the record actually has,
+ * the extra trailing columns must be dropped instead of falling back to
+ * numbered keys */
+void test_fields_overflow_dropped()
+{
+    struct flb_parser *parser = NULL;
+    struct flb_config *config = NULL;
+    int ret;
+    char *input = "1,2,3";
+    char *field_names[] = { "x", "y" };
+    void *out_buf = NULL;
+    size_t out_size = 0;
+    struct flb_time out_time;
+    char *expected_strs[] = { "x", "1", "y", "2" };
+    struct str_list expected = { sizeof(expected_strs) / sizeof(char *), expected_strs };
+
+    config = flb_config_init();
+    TEST_CHECK(config != NULL);
+
+    parser = flb_parser_create("csv", "csv", NULL, FLB_FALSE, NULL, NULL, NULL,
+                               FLB_FALSE, FLB_FALSE, FLB_FALSE, FLB_FALSE,
+                               NULL, 0, NULL, config);
+    TEST_CHECK(parser != NULL);
+
+    ret = flb_parser_csv_set_fields(parser, field_names, 2);
+    TEST_CHECK(ret == 0);
 
     ret = flb_parser_do(parser, input, strlen(input), &out_buf, &out_size, &out_time);
     if (!TEST_CHECK(ret != -1)) {
@@ -500,6 +577,8 @@ TEST_LIST = {
     { "basic", test_basic},
     { "custom_delimiter", test_custom_delimiter},
     { "trailing_empty_field", test_trailing_empty_field},
+    { "empty_value_dropped", test_empty_value_dropped},
+    { "fields_overflow_dropped", test_fields_overflow_dropped},
     { "quoted_fields", test_quoted_fields},
     { "named_fields", test_named_fields},
     { "time_key_by_index", test_time_key_by_index},
