@@ -98,8 +98,12 @@ struct flb_out_http {
     size_t batch_held_size;    /* bytes of held chunks */
     struct mk_list batch_held; /* list of held chunks */
 
-    /* Batch ids used in the logs */
+    /* Batch status events */
+    flb_sds_t batch_status_tag;              /* tag of the status events */
+    flb_sds_t batch_status_storage_type;     /* storage of the status input */
+    struct flb_input_instance *status_ins;   /* input the events go through */
     uint64_t batch_seq;                      /* batch round sequence */
+    int batch_carried;                       /* records carried to next round */
     char batch_token[9];                     /* per process part of batch ids */
 
     /* HTTP URI */

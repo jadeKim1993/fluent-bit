@@ -1321,6 +1321,348 @@ void flb_test_batch_hold_chunks_no_workers()
     run_batch_test("on", "8895", "0");
 }
 
+/* batch status events received through out_lib (JSON) */
+struct status_counts {
+    int total;
+    int success;       /* 3 records sent in 1 attempt, HTTP 201, no error */
+    int empty;         /* nothing to send */
+    int retry;         /* 2 attempts, no response, an error reason */
+    int kept_413;      /* rejected with 413 and kept for the next round */
+    int dropped;
+    int success_any;   /* any success event */
+    int success_records;       /* records of all the success events */
+    int first_success_records; /* records of the first success event */
+};
+static struct status_counts status_counts;
+
+static int cb_status_event(void* data, size_t size, void* cb_data)
+{
+    flb_sds_t s;
+
+    s = flb_sds_create_len(data, size);
+    if (!s) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&result_mutex);
+    status_counts.total++;
+    if (strstr(s, "\"status\":\"success\"") && strstr(s, "\"records\":3") &&
+        strstr(s, "\"attempts\":1") && strstr(s, "\"http_status\":201") &&
+        strstr(s, "\"error\":null") && strstr(s, "\"batch_id\":\"")) {
+        status_counts.success++;
+    }
+    if (strstr(s, "\"status\":\"empty\"") && strstr(s, "\"records\":0") &&
+        strstr(s, "\"attempts\":0") && strstr(s, "\"http_status\":null")) {
+        status_counts.empty++;
+    }
+    if (strstr(s, "\"status\":\"retry_next_interval\"") &&
+        strstr(s, "\"attempts\":2") && strstr(s, "\"http_status\":null") &&
+        !strstr(s, "\"error\":null")) {
+        status_counts.retry++;
+    }
+    if (strstr(s, "\"status\":\"retry_next_interval\"") &&
+        strstr(s, "\"http_status\":413") && strstr(s, "\"attempts\":1")) {
+        status_counts.kept_413++;
+    }
+    if (strstr(s, "\"status\":\"dropped\"")) {
+        status_counts.dropped++;
+    }
+    if (strstr(s, "\"status\":\"success\"")) {
+        char *p = strstr(s, "\"records\":");
+        int n = p ? atoi(p + 10) : 0;
+
+        if (status_counts.success_any == 0) {
+            status_counts.first_success_records = n;
+        }
+        status_counts.success_any++;
+        status_counts.success_records += n;
+    }
+    pthread_mutex_unlock(&result_mutex);
+
+    flb_sds_destroy(s);
+    return 0;
+}
+
+static struct status_counts run_status_test(char *hold_chunks, char *port,
+                                            int with_receiver, int records)
+{
+    int i;
+    int ret;
+    int i_ffd;
+    int o_ffd;
+    struct test_ctx *ctx;
+    struct flb_lib_out_cb cb;
+    struct status_counts result;
+    char *buf = "[1, {\"msg\":\"hello world\"}]";
+    size_t size = strlen(buf);
+
+    cb.cb   = cb_status_event;
+    cb.data = NULL;
+    clear_output_num();
+    memset(&status_counts, 0, sizeof(status_counts));
+
+    ctx = test_ctx_create();
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_input_set(ctx->flb, ctx->i_ffd, "tag", "lib", NULL);
+    TEST_CHECK(ret == 0);
+
+    /* receiver: its records have no route, only the HTTP status matters */
+    if (with_receiver) {
+        i_ffd = flb_input(ctx->flb, (char *) "http", NULL);
+        TEST_CHECK(i_ffd >= 0);
+        ret = flb_input_set(ctx->flb, i_ffd,
+                            "port", port,
+                            "tag", "http",
+                            "host", "127.0.0.1",
+                            NULL);
+        TEST_CHECK(ret == 0);
+    }
+
+    /* status events */
+    o_ffd = flb_output(ctx->flb, (char *) "lib", &cb);
+    TEST_CHECK(o_ffd >= 0);
+    ret = flb_output_set(ctx->flb, o_ffd,
+                         "match", "batch.status",
+                         "format", "json",
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_output_set(ctx->flb, ctx->o_ffd,
+                         "match", "lib",
+                         "host", "127.0.0.1",
+                         "port", port,
+                         "format", "json",
+                         "json_events_key", "events",
+                         "batch_interval", "2",
+                         "batch_hold_chunks", hold_chunks,
+                         "batch_status_tag", "batch.status",
+                         "workers", "1",
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    for (i = 0; i < records; i++) {
+        ret = flb_lib_push(ctx->flb, ctx->i_ffd, (char *) buf, size);
+        TEST_CHECK(ret >= 0);
+        flb_time_msleep(100);
+    }
+
+    /* first round sends the records, the next one finds nothing */
+    flb_time_msleep(5000);
+
+    pthread_mutex_lock(&result_mutex);
+    result = status_counts;
+    pthread_mutex_unlock(&result_mutex);
+
+    test_ctx_destroy(ctx);
+
+    return result;
+}
+
+static void check_status_success(char *hold_chunks, char *port)
+{
+    struct status_counts r;
+
+    r = run_status_test(hold_chunks, port, FLB_TRUE, 3);
+    if (!TEST_CHECK(r.success == 1)) {
+        TEST_MSG("expected 1 success event, got %d (total %d)",
+                 r.success, r.total);
+    }
+    if (!TEST_CHECK(r.empty >= 1)) {
+        TEST_MSG("expected an empty event, got %d (total %d)",
+                 r.empty, r.total);
+    }
+}
+
+/* a batch round emits 'success', a round with nothing to send 'empty' */
+void flb_test_batch_status_events()
+{
+    check_status_success("off", "8892");
+}
+
+void flb_test_batch_status_events_hold()
+{
+    check_status_success("on", "8893");
+}
+
+/* a failed round emits 'retry_next_interval' with the reason */
+void flb_test_batch_status_retry()
+{
+    struct status_counts r;
+
+    /* nothing listens on this port */
+    r = run_status_test("off", "8899", FLB_FALSE, 2);
+    if (!TEST_CHECK(r.retry >= 1)) {
+        TEST_MSG("expected a retry_next_interval event, got %d (total %d)",
+                 r.retry, r.total);
+    }
+    TEST_CHECK(r.success == 0);
+}
+
+/*
+ * Runs a batch output with status events against an in_http receiver. The
+ * receiver buffer limit can be lowered to make it answer 413.
+ */
+static struct status_counts run_limit_test(char *port, char *hold_chunks,
+                                           char *max_chunks,
+                                           char *receiver_max_size,
+                                           int records, int wait_ms)
+{
+    int i;
+    int ret;
+    int i_ffd;
+    int o_ffd;
+    struct test_ctx *ctx;
+    struct flb_lib_out_cb cb;
+    struct status_counts result;
+    char *buf = "[1, {\"msg\":\"hello world\"}]";
+    size_t size = strlen(buf);
+
+    cb.cb   = cb_status_event;
+    cb.data = NULL;
+    clear_output_num();
+    memset(&status_counts, 0, sizeof(status_counts));
+
+    ctx = test_ctx_create();
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_input_set(ctx->flb, ctx->i_ffd, "tag", "lib", NULL);
+    TEST_CHECK(ret == 0);
+
+    i_ffd = flb_input(ctx->flb, (char *) "http", NULL);
+    TEST_CHECK(i_ffd >= 0);
+    ret = flb_input_set(ctx->flb, i_ffd,
+                        "port", port,
+                        "tag", "http",
+                        "host", "127.0.0.1",
+                        NULL);
+    TEST_CHECK(ret == 0);
+    if (receiver_max_size) {
+        ret = flb_input_set(ctx->flb, i_ffd,
+                            "buffer_chunk_size", "64",
+                            "buffer_max_size", receiver_max_size,
+                            NULL);
+        TEST_CHECK(ret == 0);
+    }
+
+    o_ffd = flb_output(ctx->flb, (char *) "lib", &cb);
+    TEST_CHECK(o_ffd >= 0);
+    ret = flb_output_set(ctx->flb, o_ffd,
+                         "match", "batch.status",
+                         "format", "json",
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_output_set(ctx->flb, ctx->o_ffd,
+                         "match", "lib",
+                         "host", "127.0.0.1",
+                         "port", port,
+                         "format", "json",
+                         "json_events_key", "events",
+                         "batch_interval", "2",
+                         "batch_hold_chunks", hold_chunks,
+                         "batch_hold_max_chunks", max_chunks,
+                         "batch_status_tag", "batch.status",
+                         "retry_limit", "no_limits",
+                         "http.response_timeout", "2s",
+                         "workers", "1",
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    /* one record per engine flush (Flush 0.2): one chunk per record */
+    for (i = 0; i < records; i++) {
+        ret = flb_lib_push(ctx->flb, ctx->i_ffd, (char *) buf, size);
+        TEST_CHECK(ret >= 0);
+        flb_time_msleep(300);
+    }
+
+    flb_time_msleep(wait_ms);
+
+    pthread_mutex_lock(&result_mutex);
+    result = status_counts;
+    pthread_mutex_unlock(&result_mutex);
+
+    test_ctx_destroy(ctx);
+
+    return result;
+}
+
+/* a batch larger than the receiver accepts (413) is kept, not dropped */
+void flb_test_batch_413_kept()
+{
+    struct status_counts r;
+
+    r = run_limit_test("8896", "on", "512", "128", 10, 4000);
+    if (!TEST_CHECK(r.kept_413 >= 1)) {
+        TEST_MSG("expected a retry_next_interval event with HTTP 413, "
+                 "got %d (total %d)", r.kept_413, r.total);
+    }
+    if (!TEST_CHECK(r.dropped == 0)) {
+        TEST_MSG("the batch was dropped %d time(s)", r.dropped);
+    }
+}
+
+/* chunks above batch_hold_max_chunks wait in storage and are sent later */
+void flb_test_batch_hold_max_chunks()
+{
+    struct status_counts r;
+
+    r = run_limit_test("8897", "on", "2", NULL, 5, 20000);
+    if (!TEST_CHECK(r.first_success_records >= 1 &&
+                    r.first_success_records <= 2)) {
+        TEST_MSG("first batch had %d records, expected at most 2 chunks",
+                 r.first_success_records);
+    }
+    if (!TEST_CHECK(r.success_records == 5)) {
+        TEST_MSG("expected all 5 records delivered, got %d in %d batches",
+                 r.success_records, r.success_any);
+    }
+    TEST_CHECK(r.dropped == 0);
+}
+
+/* the status tag must not be matched by the batch output itself */
+void flb_test_batch_status_tag_loop()
+{
+    int ret;
+    struct test_ctx *ctx;
+
+    ctx = test_ctx_create();
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_output_set(ctx->flb, ctx->o_ffd,
+                         "match", "*",
+                         "host", "127.0.0.1",
+                         "port", "8899",
+                         "batch_interval", "2",
+                         "batch_status_tag", "batch.status",
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_start(ctx->flb);
+    if (!TEST_CHECK(ret == -1)) {
+        TEST_MSG("the engine started although the status tag loops back");
+        flb_stop(ctx->flb);
+    }
+
+    flb_destroy(ctx->flb);
+    flb_free(ctx);
+}
+
 /* test to make sure out_http is always able to work with in_http by default. */
 void flb_test_in_http()
 {
@@ -1432,6 +1774,12 @@ TEST_LIST = {
     {"batch_hold_chunks", flb_test_batch_hold_chunks},
     {"batch_interval_no_workers", flb_test_batch_interval_no_workers},
     {"batch_hold_chunks_no_workers", flb_test_batch_hold_chunks_no_workers},
+    {"batch_status_events", flb_test_batch_status_events},
+    {"batch_status_events_hold", flb_test_batch_status_events_hold},
+    {"batch_status_retry", flb_test_batch_status_retry},
+    {"batch_status_tag_loop", flb_test_batch_status_tag_loop},
+    {"batch_413_kept", flb_test_batch_413_kept},
+    {"batch_hold_max_chunks", flb_test_batch_hold_max_chunks},
     {"in_http", flb_test_in_http},
     {NULL, NULL}
 };

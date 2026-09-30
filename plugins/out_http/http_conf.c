@@ -25,6 +25,9 @@
 #include <fluent-bit/flb_http_client.h>
 #include <fluent-bit/flb_record_accessor.h>
 #include <fluent-bit/flb_oauth2.h>
+#include <fluent-bit/flb_input.h>
+#include <fluent-bit/flb_router.h>
+#include <fluent-bit/flb_storage.h>
 #include <fluent-bit/flb_random.h>
 
 #ifdef FLB_HAVE_SIGNV4
@@ -34,6 +37,66 @@
 #endif
 #include "http.h"
 #include "http_conf.h"
+
+/* Create the input the batch status events are ingested through */
+static int batch_status_create(struct flb_out_http *ctx,
+                               struct flb_config *config)
+{
+    int ret;
+    char name[256];
+    struct flb_input_instance *ins;
+
+    snprintf(name, sizeof(name), "%s_batch_status",
+             flb_output_name(ctx->ins));
+
+    if (flb_input_name_exists(name, config) == FLB_TRUE) {
+        flb_plg_error(ctx->ins, "input '%s' already exists", name);
+        return -1;
+    }
+
+    ins = flb_input_new(config, "emitter", NULL, FLB_FALSE);
+    if (!ins) {
+        flb_plg_error(ctx->ins, "cannot create the batch status input, "
+                      "the 'emitter' input plugin is required "
+                      "(FLB_IN_EMITTER)");
+        return -1;
+    }
+
+    ret = flb_input_set_property(ins, "alias", name);
+    if (ret == -1) {
+        flb_plg_warn(ctx->ins, "cannot set batch status input name, "
+                     "using '%s'", ins->name);
+    }
+
+    ret = flb_input_set_property(ins, "storage.type",
+                                 ctx->batch_status_storage_type);
+    if (ret == -1) {
+        flb_plg_error(ctx->ins, "invalid 'batch_status_storage.type' '%s'",
+                      ctx->batch_status_storage_type);
+        flb_input_instance_destroy(ins);
+        return -1;
+    }
+
+    ret = flb_input_instance_init(ins, config);
+    if (ret == -1) {
+        flb_plg_error(ctx->ins, "cannot initialize the batch status input");
+        flb_input_instance_exit(ins, config);
+        flb_input_instance_destroy(ins);
+        return -1;
+    }
+
+    ret = flb_storage_input_create(config->cio, ins);
+    if (ret == -1) {
+        flb_plg_error(ctx->ins, "cannot initialize storage for '%s'", name);
+        flb_input_instance_exit(ins, config);
+        flb_input_instance_destroy(ins);
+        return -1;
+    }
+
+    ctx->status_ins = ins;
+
+    return 0;
+}
 
 struct flb_out_http *flb_http_conf_create(struct flb_output_instance *ins,
                                           struct flb_config *config)
@@ -467,6 +530,34 @@ struct flb_out_http *flb_http_conf_create(struct flb_output_instance *ins,
         ctx->oauth2_ctx = flb_oauth2_create_from_config(config, &ctx->oauth2_config);
         if (!ctx->oauth2_ctx) {
             flb_plg_error(ctx->ins, "failed to initialize oauth2 context");
+            flb_http_conf_destroy(ctx);
+            return NULL;
+        }
+    }
+
+    /* Batch status events */
+    if (ctx->batch_status_tag) {
+        if (ctx->batch_interval <= 0) {
+            flb_plg_warn(ctx->ins, "'batch_status_tag' requires "
+                         "'batch_interval', ignoring it");
+        }
+        else if (ins->match &&
+                 flb_router_match(ctx->batch_status_tag,
+                                  flb_sds_len(ctx->batch_status_tag),
+                                  ins->match,
+#ifdef FLB_HAVE_REGEX
+                                  ins->match_regex
+#else
+                                  NULL
+#endif
+                                  )) {
+            flb_plg_error(ctx->ins, "'batch_status_tag' %s is matched by this "
+                          "output: its status events would be batched again",
+                          ctx->batch_status_tag);
+            flb_http_conf_destroy(ctx);
+            return NULL;
+        }
+        else if (batch_status_create(ctx, config) == -1) {
             flb_http_conf_destroy(ctx);
             return NULL;
         }

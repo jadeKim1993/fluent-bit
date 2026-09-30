@@ -29,6 +29,9 @@
 #include <fluent-bit/flb_scheduler.h>
 #include <fluent-bit/flb_stream.h>
 #include <fluent-bit/flb_upstream_conn.h>
+#include <fluent-bit/flb_input.h>
+#include <fluent-bit/flb_input_chunk.h>
+#include <fluent-bit/flb_log_event_encoder.h>
 #include <fluent-bit/flb_random.h>
 #include <fluent-bit/flb_sds.h>
 
@@ -116,6 +119,7 @@ static void append_headers(struct flb_http_client *c,
 
 /* Optional request details, used to report the result of a batch */
 struct http_request_info {
+    const char *batch_id;           /* sent as X-Batch-Id when set */
     int http_status;                /* response status, 0 if none */
     char error[128];                /* reason of a failure */
 };
@@ -301,6 +305,12 @@ static int http_request(struct flb_out_http *ctx,
         flb_http_add_header(c,
                             key->str, flb_sds_len(key->str),
                             val->str, flb_sds_len(val->str));
+    }
+
+    /* Lets the receiver match the request with its batch status event */
+    if (info && info->batch_id) {
+        flb_http_add_header(c, "X-Batch-Id", 10,
+                            info->batch_id, strlen(info->batch_id));
     }
 
 #ifdef FLB_HAVE_SIGNV4
@@ -725,15 +735,18 @@ static int batch_append(struct flb_out_http *ctx,
     return FLB_OK;
 }
 
-/* Details of one batch round, used in the logs */
+/* Details of one batch round, reported as a batch status event */
 struct batch_report {
     char batch_id[160];
     int records;
+    int carried_over;
     size_t bytes;
     int attempts;
     int64_t duration_ms;
     uint64_t started_ms;            /* monotonic, for the duration */
     struct flb_time started;
+    struct flb_time first;          /* time of the first record */
+    struct flb_time last;           /* time of the last record */
     struct http_request_info req;
 };
 
@@ -751,6 +764,154 @@ static void batch_report_init(struct flb_out_http *ctx,
              (long long) rep->started.tm.tv_sec,
              (unsigned long long) ctx->batch_seq,
              ctx->batch_token);
+
+    rep->carried_over = ctx->batch_carried;
+    if (ctx->status_ins) {
+        rep->req.batch_id = rep->batch_id;
+    }
+}
+
+/* Count the records of a batch and get the time of the first and last one */
+static int batch_scan(const char *buf, size_t size,
+                      struct flb_time *first, struct flb_time *last)
+{
+    int count = 0;
+    struct flb_log_event log_event;
+    struct flb_log_event_decoder decoder;
+
+    flb_time_zero(first);
+    flb_time_zero(last);
+
+    if (flb_log_event_decoder_init(&decoder, (char *) buf, size) !=
+        FLB_EVENT_DECODER_SUCCESS) {
+        return 0;
+    }
+
+    while (flb_log_event_decoder_next(&decoder, &log_event) ==
+           FLB_EVENT_DECODER_SUCCESS) {
+        if (count == 0) {
+            flb_time_copy(first, &log_event.timestamp);
+        }
+        flb_time_copy(last, &log_event.timestamp);
+        count++;
+    }
+
+    flb_log_event_decoder_destroy(&decoder);
+
+    return count;
+}
+
+/* Append 'key: <ISO 8601 UTC time>', or 'key: null' when the time is unset */
+static int batch_append_time(struct flb_log_event_encoder *enc,
+                             char *key, struct flb_time *t, int set)
+{
+    int ret;
+    size_t len;
+    time_t sec;
+    struct tm tm;
+    char buf[40];
+
+    ret = flb_log_event_encoder_append_body_cstring(enc, key);
+    if (!set) {
+        return ret | flb_log_event_encoder_append_body_null(enc);
+    }
+
+    sec = t->tm.tv_sec;
+    gmtime_r(&sec, &tm);
+    len = strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm);
+    snprintf(buf + len, sizeof(buf) - len, ".%03ldZ",
+             (long) (t->tm.tv_nsec / 1000000));
+
+    return ret | flb_log_event_encoder_append_body_cstring(enc, buf);
+}
+
+/*
+ * Emit the result of a batch round as a record tagged with batch_status_tag.
+ * It is queued in the ring buffer of the status input, which is safe from
+ * the worker thread; the engine turns it into a regular chunk.
+ */
+static void batch_emit_status(struct flb_out_http *ctx,
+                              struct flb_config *config,
+                              char *status, struct batch_report *rep)
+{
+    int ret;
+    struct flb_log_event_encoder enc;
+
+    if (!ctx->status_ins) {
+        return;
+    }
+
+    /* the engine no longer collects records */
+    if (config->is_running == FLB_FALSE) {
+        return;
+    }
+
+    ret = flb_log_event_encoder_init(&enc, FLB_LOG_EVENT_FORMAT_DEFAULT);
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        flb_plg_error(ctx->ins, "cannot initialize the batch status encoder");
+        return;
+    }
+
+    ret = flb_log_event_encoder_begin_record(&enc);
+    ret |= flb_log_event_encoder_set_current_timestamp(&enc);
+    ret |= flb_log_event_encoder_append_body_values(&enc,
+               FLB_LOG_EVENT_CSTRING_VALUE("batch_id"),
+               FLB_LOG_EVENT_CSTRING_VALUE(rep->batch_id),
+               FLB_LOG_EVENT_CSTRING_VALUE("output"),
+               FLB_LOG_EVENT_CSTRING_VALUE((char *) flb_output_name(ctx->ins)),
+               FLB_LOG_EVENT_CSTRING_VALUE("status"),
+               FLB_LOG_EVENT_CSTRING_VALUE(status),
+               FLB_LOG_EVENT_CSTRING_VALUE("http_status"));
+    if (rep->req.http_status > 0) {
+        ret |= flb_log_event_encoder_append_body_int64(&enc,
+                                                       rep->req.http_status);
+    }
+    else {
+        ret |= flb_log_event_encoder_append_body_null(&enc);
+    }
+    ret |= flb_log_event_encoder_append_body_values(&enc,
+               FLB_LOG_EVENT_CSTRING_VALUE("records"),
+               FLB_LOG_EVENT_INT64_VALUE(rep->records),
+               FLB_LOG_EVENT_CSTRING_VALUE("carried_over_records"),
+               FLB_LOG_EVENT_INT64_VALUE(rep->carried_over),
+               FLB_LOG_EVENT_CSTRING_VALUE("bytes"),
+               FLB_LOG_EVENT_INT64_VALUE((int64_t) rep->bytes),
+               FLB_LOG_EVENT_CSTRING_VALUE("attempts"),
+               FLB_LOG_EVENT_INT64_VALUE(rep->attempts));
+    ret |= batch_append_time(&enc, "started_at", &rep->started, FLB_TRUE);
+    ret |= flb_log_event_encoder_append_body_values(&enc,
+               FLB_LOG_EVENT_CSTRING_VALUE("duration_ms"),
+               FLB_LOG_EVENT_INT64_VALUE(rep->duration_ms));
+    ret |= batch_append_time(&enc, "first_record_time", &rep->first,
+                             rep->records > 0);
+    ret |= batch_append_time(&enc, "last_record_time", &rep->last,
+                             rep->records > 0);
+    ret |= flb_log_event_encoder_append_body_cstring(&enc, "error");
+    if (rep->req.error[0] != '\0') {
+        ret |= flb_log_event_encoder_append_body_cstring(&enc, rep->req.error);
+    }
+    else {
+        ret |= flb_log_event_encoder_append_body_null(&enc);
+    }
+    ret |= flb_log_event_encoder_commit_record(&enc);
+
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        flb_plg_error(ctx->ins, "cannot encode the batch status event");
+    }
+    else {
+        ret = flb_input_chunk_ring_buffer_enqueue(ctx->status_ins,
+                                                  FLB_INPUT_LOGS, 1,
+                                                  ctx->batch_status_tag,
+                                                  flb_sds_len(ctx->batch_status_tag),
+                                                  enc.output_buffer,
+                                                  enc.output_length);
+        if (ret != 0) {
+            flb_plg_warn(ctx->ins, "could not queue batch status event '%s'",
+                         rep->batch_id);
+        }
+    }
+
+    flb_log_event_encoder_destroy(&enc);
 }
 
 /*
@@ -912,6 +1073,7 @@ static int batch_send_held(struct flb_out_http *ctx, struct flb_config *config,
         if (due && !stopping) {
             batch_report_init(ctx, &rep);
             flb_plg_debug(ctx->ins, "batch %s: nothing to send", rep.batch_id);
+            batch_emit_status(ctx, config, "empty", &rep);
         }
         return FLB_OK;
     }
@@ -941,7 +1103,7 @@ static int batch_send_held(struct flb_out_http *ctx, struct flb_config *config,
         /* the first chunk stays held while the request is in flight */
         entry = mk_list_entry_first(&ctx->batch_held,
                                     struct http_batch_entry, _head);
-        rep.records = flb_mp_count_log_records(buf, flb_sds_len(buf));
+        rep.records = batch_scan(buf, flb_sds_len(buf), &rep.first, &rep.last);
         ret = batch_request(ctx, buf, flb_sds_len(buf),
                             entry->tag, entry->tag_len, stopping, &rep, config);
         flb_sds_destroy(buf);
@@ -954,9 +1116,12 @@ static int batch_send_held(struct flb_out_http *ctx, struct flb_config *config,
                      "kept in storage for the next interval in %is",
                      rep.batch_id, rep.req.error, rep.records, count,
                      ctx->batch_interval);
+        ctx->batch_carried = rep.records;
+        batch_emit_status(ctx, config, "retry_next_interval", &rep);
         return ret;
     }
 
+    ctx->batch_carried = 0;
 
     if (ret == FLB_OK) {
         flb_plg_info(ctx->ins, "batch %s sent: %i records (%i chunks), "
@@ -964,17 +1129,20 @@ static int batch_send_held(struct flb_out_http *ctx, struct flb_config *config,
                      rep.batch_id, rep.records, count, rep.bytes,
                      rep.req.http_status, rep.attempts,
                      (long long) rep.duration_ms);
+        batch_emit_status(ctx, config, "success", &rep);
     }
     else if (ret == FLB_RETRY) {
         flb_plg_warn(ctx->ins, "batch %s failed on shutdown: %s; %i records "
                      "(%i chunks) stay in storage and are sent again after "
                      "a restart", rep.batch_id, rep.req.error, rep.records,
                      count);
+        batch_emit_status(ctx, config, "failed_on_shutdown", &rep);
     }
     else {
         flb_plg_error(ctx->ins, "batch %s dropped: %s; %i records (%i chunks) "
                       "are lost", rep.batch_id, rep.req.error, rep.records,
                       count);
+        batch_emit_status(ctx, config, "dropped", &rep);
     }
 
     batch_release(ctx, count, ret);
@@ -996,6 +1164,7 @@ static int batch_send(struct flb_out_http *ctx, struct flb_config *config,
         if (due && !stopping) {
             batch_report_init(ctx, &rep);
             flb_plg_debug(ctx->ins, "batch %s: nothing to send", rep.batch_id);
+            batch_emit_status(ctx, config, "empty", &rep);
         }
         return FLB_OK;
     }
@@ -1010,7 +1179,7 @@ static int batch_send(struct flb_out_http *ctx, struct flb_config *config,
     ctx->batch_tag = NULL;
 
     batch_report_init(ctx, &rep);
-    rep.records = flb_mp_count_log_records(buf, flb_sds_len(buf));
+    rep.records = batch_scan(buf, flb_sds_len(buf), &rep.first, &rep.last);
 
     ret = batch_request(ctx, buf, flb_sds_len(buf),
                         tag, flb_sds_len(tag), stopping, &rep, config);
@@ -1021,6 +1190,8 @@ static int batch_send(struct flb_out_http *ctx, struct flb_config *config,
                      "%i attempt(s), %lld ms", rep.batch_id, rep.records,
                      rep.bytes, rep.req.http_status, rep.attempts,
                      (long long) rep.duration_ms);
+        ctx->batch_carried = 0;
+        batch_emit_status(ctx, config, "success", &rep);
     }
     else if (ret == FLB_RETRY) {
         /* put the records back in front of the new batch */
@@ -1031,8 +1202,10 @@ static int batch_send(struct flb_out_http *ctx, struct flb_config *config,
                 flb_plg_error(ctx->ins, "batch %s dropped: out of memory "
                               "while keeping it; %i records are lost",
                               rep.batch_id, rep.records);
+                ctx->batch_carried = 0;
                 snprintf(rep.req.error, sizeof(rep.req.error),
                          "out of memory while keeping the batch");
+                batch_emit_status(ctx, config, "dropped", &rep);
                 flb_sds_destroy(buf);
                 flb_sds_destroy(tag);
                 return FLB_ERROR;
@@ -1054,11 +1227,17 @@ static int batch_send(struct flb_out_http *ctx, struct flb_config *config,
                          "the next interval in %is", rep.batch_id,
                          rep.req.error, rep.records, ctx->batch_interval);
         }
+        ctx->batch_carried = rep.records;
+        batch_emit_status(ctx, config,
+                          stopping ? "failed_on_shutdown" : "retry_next_interval",
+                          &rep);
         return ret;
     }
     else {
         flb_plg_error(ctx->ins, "batch %s dropped: %s; %i records are lost",
                       rep.batch_id, rep.req.error, rep.records);
+        ctx->batch_carried = 0;
+        batch_emit_status(ctx, config, "dropped", &rep);
     }
 
     flb_sds_destroy(buf);
@@ -1585,6 +1764,17 @@ static struct flb_config_map config_map[] = {
      0, FLB_TRUE, offsetof(struct flb_out_http, batch_retry_4xx),
      "Keep a batch rejected with a 4xx status and retry it on the next "
      "interval instead of dropping it. A 413 is always kept"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "batch_status_tag", NULL,
+     0, FLB_TRUE, offsetof(struct flb_out_http, batch_status_tag),
+     "Emit the result of every batch round as a record with this tag, so it "
+     "can be routed to another output (e.g: pgsql)"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "batch_status_storage.type", "memory",
+     0, FLB_TRUE, offsetof(struct flb_out_http, batch_status_storage_type),
+     "Storage type of the batch status events: 'memory' or 'filesystem'"
     },
     {
      FLB_CONFIG_MAP_STR, "compress", NULL,
