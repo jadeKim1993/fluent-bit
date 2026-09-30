@@ -1,0 +1,23 @@
+service:
+  flush: 1
+  log_level: info
+
+pipeline:
+  inputs:
+    - name: http
+      listen: 127.0.0.1
+      port: 9880
+      tag: app
+
+  outputs:
+    - name: http
+      alias: batch_out
+      match: app
+      host: 127.0.0.1
+      port: 9001
+      format: json
+      json_events_key: events
+      json_count_key: count
+      json_date_key: false
+      batch_interval: 5
+      workers: 1

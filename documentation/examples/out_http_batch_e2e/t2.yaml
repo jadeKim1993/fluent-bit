@@ -1,0 +1,36 @@
+service:
+  flush: 1
+  grace: 10
+  log_level: info
+  storage.path: /work/storage2
+  storage.sync: normal
+
+pipeline:
+  inputs:
+    - name: http
+      listen: 127.0.0.1
+      port: 9880
+      tag: app
+      storage.type: filesystem
+
+  outputs:
+    - name: http                      # batch output, chunks held until delivered
+      alias: batch_out
+      match: app
+      host: 127.0.0.1
+      port: 9001
+      format: json
+      json_events_key: events
+      json_date_key: false
+      batch_interval: ${BATCH}
+      batch_hold_chunks: on
+      retry_limit: no_limits
+      workers: 1
+
+    - name: http                      # another output on the same input
+      alias: other_out
+      match: app
+      host: 127.0.0.1
+      port: 9002
+      format: json
+      json_date_key: false

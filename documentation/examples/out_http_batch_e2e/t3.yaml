@@ -1,0 +1,36 @@
+service:
+  flush: 1
+  grace: 5
+  log_level: info
+  storage.path: /work/storage3
+
+pipeline:
+  inputs:
+    - name: http
+      listen: 127.0.0.1
+      port: 9880
+      tag: app
+
+  outputs:
+    - name: http
+      alias: batch_out
+      match: app
+      host: 127.0.0.1
+      port: 9001
+      format: json
+      json_events_key: events
+      json_date_key: false
+      batch_interval: 3
+      batch_status_tag: batch.status
+      batch_status_storage.type: filesystem
+      workers: 1
+
+    - name: pgsql
+      match: batch.status
+      host: e2e-pg
+      port: 5432
+      user: fluent
+      password: fluent_test_pw
+      database: logs
+      table: batch_events
+      retry_limit: no_limits

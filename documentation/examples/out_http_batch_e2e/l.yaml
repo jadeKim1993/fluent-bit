@@ -1,0 +1,40 @@
+service:
+  flush: ${FLUSH}
+  grace: 10
+  log_level: info
+  scheduler.cap: 10
+  storage.path: /work/lstore
+  storage.sync: normal
+  storage.backlog.mem_limit: ${BL_MEM}
+
+pipeline:
+  inputs:
+    - name: http
+      listen: 127.0.0.1
+      port: 9880
+      tag: app
+      storage.type: filesystem
+
+  outputs:
+    - name: http
+      alias: batch_out
+      match: app
+      host: 127.0.0.1
+      port: 9001
+      format: json
+      json_events_key: events
+      json_date_key: false
+      batch_interval: ${INTERVAL}
+      batch_hold_chunks: on
+      batch_max_size: ${MAX_SIZE}
+      batch_hold_max_chunks: ${MAX_CHUNKS}
+      batch_retry_4xx: ${RETRY_4XX}
+      batch_status_tag: batch.status
+      retry_limit: no_limits
+      http.response_timeout: ${RESP_TIMEOUT}
+      workers: 1
+
+    - name: stdout
+      match: batch.status
+      format: json_lines
+      json_date_key: false
