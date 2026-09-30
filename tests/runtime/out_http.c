@@ -1099,12 +1099,226 @@ void flb_test_json_date_format_java_sql_timestamp()
     test_ctx_destroy(ctx);
 }
 
+static void run_json_events_key_test(char *count_key, char *expected_json)
+{
+    struct test_ctx *ctx;
+    int ret;
+    int num;
+
+    char *buf1 = "[1, {\"msg\":\"hello world\"}]";
+    size_t size1 = strlen(buf1);
+    char *buf2 = "[2, {\"msg\":\"hello world\"}]";
+    size_t size2 = strlen(buf2);
+
+    char *expected_strs[] = {expected_json};
+    struct str_list expected = {
+                                .size = sizeof(expected_strs)/sizeof(char*),
+                                .lists = &expected_strs[0],
+    };
+
+    clear_output_num();
+
+    ctx = test_ctx_create();
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_output_set(ctx->flb, ctx->o_ffd,
+                         "match", "*",
+                         "format", "json",
+                         "json_events_key", "events",
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    if (count_key != NULL) {
+        ret = flb_output_set(ctx->flb, ctx->o_ffd,
+                             "json_count_key", count_key,
+                             NULL);
+        TEST_CHECK(ret == 0);
+    }
+
+    ret = flb_output_set_test(ctx->flb, ctx->o_ffd,
+                         "formatter", cb_check_str_list,
+                          &expected, NULL);
+    TEST_CHECK(ret == 0);
+
+    /* Start the engine */
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    /* Ingest data sample */
+    ret = flb_lib_push(ctx->flb, ctx->i_ffd, (char *) buf1, size1);
+    TEST_CHECK(ret >= 0);
+    ret = flb_lib_push(ctx->flb, ctx->i_ffd, (char *) buf2, size2);
+    TEST_CHECK(ret >= 0);
+
+    /* waiting to flush */
+    flb_time_msleep(500);
+
+    num = get_output_num();
+    if (!TEST_CHECK(num > 0))  {
+        TEST_MSG("no outputs");
+    }
+    check_callback_error();
+
+    test_ctx_destroy(ctx);
+}
+
+void flb_test_json_events_key()
+{
+    run_json_events_key_test(NULL,
+        "{\"count\":2,\"events\":[{\"date\":1.0,\"msg\":\"hello world\"},"
+        "{\"date\":2.0,\"msg\":\"hello world\"}]}");
+}
+
+void flb_test_json_events_key_count_key()
+{
+    run_json_events_key_test("total",
+        "{\"total\":2,\"events\":[{\"date\":1.0,\"msg\":\"hello world\"},"
+        "{\"date\":2.0,\"msg\":\"hello world\"}]}");
+}
+
+void flb_test_json_events_key_disable_count()
+{
+    run_json_events_key_test("false",
+        "{\"events\":[{\"date\":1.0,\"msg\":\"hello world\"},"
+        "{\"date\":2.0,\"msg\":\"hello world\"}]}");
+}
+
 int callback_test(void* data, size_t size, void* cb_data)
 {
     if (size > 0) {
         increment_output_num();
     }
     return 0;
+}
+
+static int batch_saw_count = 0;
+
+/* in_http turns every request body object into a single record */
+static int callback_batch(void* data, size_t size, void* cb_data)
+{
+    flb_sds_t s;
+
+    if (size > 0) {
+        increment_output_num();
+
+        s = flb_sds_create_len(data, size);
+        if (s && strstr(s, (char *) cb_data) != NULL) {
+            pthread_mutex_lock(&result_mutex);
+            batch_saw_count++;
+            pthread_mutex_unlock(&result_mutex);
+        }
+        flb_sds_destroy(s);
+    }
+    return 0;
+}
+
+/* records flushed during an interval must be sent in exactly one request */
+static void run_batch_test(char *hold_chunks, char *port, char *workers)
+{
+    struct test_ctx *ctx;
+    int ret;
+    int num;
+    int i;
+    int i_ffd;
+    int o_ffd;
+    struct flb_lib_out_cb cb;
+    char *buf = "[1, {\"msg\":\"hello world\"}]";
+    size_t size = strlen(buf);
+
+    cb.cb   = callback_batch;
+    cb.data = "\"count\":3";
+    clear_output_num();
+    batch_saw_count = 0;
+
+    ctx = test_ctx_create();
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_input_set(ctx->flb, ctx->i_ffd, "tag", "lib", NULL);
+    TEST_CHECK(ret == 0);
+
+    /* receiver */
+    i_ffd = flb_input(ctx->flb, (char *) "http", NULL);
+    TEST_CHECK(i_ffd >= 0);
+    ret = flb_input_set(ctx->flb, i_ffd,
+                        "port", port,
+                        "tag", "http",
+                        "host", "127.0.0.1",
+                        NULL);
+    TEST_CHECK(ret == 0);
+
+    o_ffd = flb_output(ctx->flb, (char *) "lib", &cb);
+    TEST_CHECK(o_ffd >= 0);
+    ret = flb_output_set(ctx->flb, o_ffd,
+                         "match", "http",
+                         "format", "json",
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_output_set(ctx->flb, ctx->o_ffd,
+                         "match", "lib",
+                         "host", "127.0.0.1",
+                         "port", port,
+                         "format", "json",
+                         "json_events_key", "events",
+                         "batch_interval", "2",
+                         "batch_hold_chunks", hold_chunks,
+                         "workers", workers,
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    /* records arrive over several engine flushes (Flush 0.2) */
+    for (i = 0; i < 3; i++) {
+        ret = flb_lib_push(ctx->flb, ctx->i_ffd, (char *) buf, size);
+        TEST_CHECK(ret >= 0);
+        flb_time_msleep(300);
+    }
+
+    /* first interval sends the batch, second one has nothing to send */
+    flb_time_msleep(4500);
+
+    num = get_output_num();
+    if (!TEST_CHECK(num == 1)) {
+        TEST_MSG("expected 1 request, got %d", num);
+    }
+    pthread_mutex_lock(&result_mutex);
+    ret = batch_saw_count;
+    pthread_mutex_unlock(&result_mutex);
+    if (!TEST_CHECK(ret == 1)) {
+        TEST_MSG("request did not contain the 3 buffered records");
+    }
+
+    test_ctx_destroy(ctx);
+}
+
+void flb_test_batch_interval()
+{
+    run_batch_test("off", "8889", "1");
+}
+
+/* chunks are held by the engine until the batch is delivered */
+void flb_test_batch_hold_chunks()
+{
+    run_batch_test("on", "8890", "1");
+}
+
+/* without workers the flush callbacks and the timer run in the engine */
+void flb_test_batch_interval_no_workers()
+{
+    run_batch_test("off", "8894", "0");
+}
+
+void flb_test_batch_hold_chunks_no_workers()
+{
+    run_batch_test("on", "8895", "0");
 }
 
 /* test to make sure out_http is always able to work with in_http by default. */
@@ -1211,6 +1425,13 @@ TEST_LIST = {
     {"json_date_format_epoch" , flb_test_json_date_format_epoch},
     {"json_date_format_iso8601" , flb_test_json_date_format_iso8601},
     {"json_date_format_java_sql_timestamp" , flb_test_json_date_format_java_sql_timestamp},
+    {"json_events_key" , flb_test_json_events_key},
+    {"json_events_key_count_key" , flb_test_json_events_key_count_key},
+    {"json_events_key_disable_count" , flb_test_json_events_key_disable_count},
+    {"batch_interval", flb_test_batch_interval},
+    {"batch_hold_chunks", flb_test_batch_hold_chunks},
+    {"batch_interval_no_workers", flb_test_batch_interval_no_workers},
+    {"batch_hold_chunks_no_workers", flb_test_batch_hold_chunks_no_workers},
     {"in_http", flb_test_in_http},
     {NULL, NULL}
 };

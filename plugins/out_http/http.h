@@ -22,6 +22,8 @@
 
 #include <fluent-bit/flb_oauth2.h>
 #include <fluent-bit/flb_sds.h>
+#include <monkey/mk_core/mk_list.h>
+#include <time.h>
 
 #define FLB_HTTP_OUT_MSGPACK        FLB_PACK_JSON_FORMAT_NONE
 #define FLB_HTTP_OUT_GELF           20
@@ -64,6 +66,41 @@ struct flb_out_http {
     int json_date_format;
     flb_sds_t json_date_key;
     flb_sds_t date_key;        /* internal use */
+
+    /* JSON envelope: {"<count_key>": N, "<events_key>": [...]} */
+    flb_sds_t json_events_key;
+    flb_sds_t json_count_key;
+    flb_sds_t count_key;       /* internal use */
+
+    /*
+     * Batch mode: records are buffered in memory and sent in a single
+     * request once per 'batch_interval'. It relies on a single worker so
+     * the flush callback and the batch timer run in the same thread.
+     */
+    int batch_interval;        /* seconds, 0 = disabled */
+    size_t batch_max_size;     /* max buffered bytes, 0 = unlimited */
+    flb_sds_t batch_buf;       /* buffered msgpack records */
+    flb_sds_t batch_tag;       /* tag of the first buffered chunk */
+    int batch_timer_created;
+    int batch_sending;         /* a batch request is in flight */
+    uint64_t batch_next;       /* next scheduled send, monotonic ms */
+
+    /*
+     * Hold mode: instead of copying records, every flush coroutine is
+     * suspended and its chunk stays in the engine (and in filesystem
+     * storage) until the batch containing it is delivered.
+     */
+    int batch_hold_chunks;
+    int batch_hold_max_chunks;  /* cap of held chunks, 0 = unlimited */
+    int batch_retry_4xx;        /* keep batches rejected with a 4xx */
+    int batch_full_warned;      /* 'batch is full' reported this round */
+    int batch_held_count;      /* number of held chunks */
+    size_t batch_held_size;    /* bytes of held chunks */
+    struct mk_list batch_held; /* list of held chunks */
+
+    /* Batch ids used in the logs */
+    uint64_t batch_seq;                      /* batch round sequence */
+    char batch_token[9];                     /* per process part of batch ids */
 
     /* HTTP URI */
     char *uri;
