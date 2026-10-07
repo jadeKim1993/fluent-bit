@@ -25,7 +25,6 @@
 #include <fluent-bit/flb_http_client.h>
 #include <fluent-bit/flb_record_accessor.h>
 #include <fluent-bit/flb_oauth2.h>
-#include <fluent-bit/flb_random.h>
 
 #ifdef FLB_HAVE_SIGNV4
 #ifdef FLB_HAVE_AWS
@@ -265,96 +264,6 @@ struct flb_out_http *flb_http_conf_create(struct flb_output_instance *ins,
         }
     }
 
-    /* JSON envelope: {"<json_count_key>": N, "<json_events_key>": [...]} */
-    ctx->count_key = ctx->json_count_key;
-    tmp = flb_output_get_property("json_count_key", ins);
-    if (tmp && flb_utils_bool(tmp) == FLB_FALSE) {
-        ctx->count_key = NULL;
-    }
-
-    if (ctx->json_events_key) {
-        if (flb_sds_len(ctx->json_events_key) == 0) {
-            flb_plg_error(ctx->ins, "'json_events_key' cannot be empty");
-            flb_upstream_destroy(upstream);
-            flb_free(uri);
-            flb_free(ctx);
-            return NULL;
-        }
-        if (ctx->out_format != FLB_PACK_JSON_FORMAT_JSON) {
-            flb_plg_warn(ctx->ins, "'json_events_key' is only supported with "
-                         "format 'json', ignoring it");
-        }
-    }
-
-    /* Batch mode */
-    mk_list_init(&ctx->batch_held);
-
-    /*
-     * Random part of the batch ids, so ids from different hosts or restarts
-     * never collide when they are stored in the same place.
-     */
-    {
-        unsigned char rnd[4];
-
-        if (flb_random_bytes(rnd, sizeof(rnd)) != 0) {
-            memset(rnd, 0, sizeof(rnd));
-        }
-        snprintf(ctx->batch_token, sizeof(ctx->batch_token),
-                 "%02x%02x%02x%02x", rnd[0], rnd[1], rnd[2], rnd[3]);
-    }
-
-    if (ctx->batch_hold_chunks && ctx->batch_interval <= 0) {
-        flb_plg_warn(ctx->ins, "'batch_hold_chunks' requires 'batch_interval', "
-                     "ignoring it");
-        ctx->batch_hold_chunks = FLB_FALSE;
-    }
-
-    if (ctx->batch_interval > 0) {
-        if (ctx->body_key) {
-            flb_plg_warn(ctx->ins, "'batch_interval' is not supported with "
-                         "'body_key', ignoring it");
-            ctx->batch_interval = 0;
-        }
-        else if (ins->tp_workers > 1) {
-            flb_plg_warn(ctx->ins, "'batch_interval' requires a single worker, "
-                         "setting 'workers' to 1");
-            ins->tp_workers = 1;
-        }
-    }
-
-    /*
-     * Long intervals: every held chunk keeps a file descriptor and an engine
-     * task, and a whole interval goes in a single request.
-     */
-    if (ctx->batch_interval > 0 && ctx->batch_hold_chunks &&
-        ctx->batch_hold_max_chunks > 0 && config->flush > 0 &&
-        ctx->batch_interval / config->flush > ctx->batch_hold_max_chunks) {
-        flb_plg_warn(ctx->ins, "about %.0f chunks per tag are flushed in one "
-                     "batch_interval (%is / flush %.1fs), more than "
-                     "batch_hold_max_chunks (%i): the rest waits in storage "
-                     "for a later interval, consider a larger 'flush'",
-                     ctx->batch_interval / config->flush, ctx->batch_interval,
-                     config->flush, ctx->batch_hold_max_chunks);
-    }
-    if (ctx->batch_interval >= 600 && ctx->batch_max_size == 0) {
-        flb_plg_warn(ctx->ins, "'batch_max_size' is not set: a whole %is "
-                     "interval goes in a single request, set a limit below "
-                     "what the receiver accepts", ctx->batch_interval);
-    }
-
-    /*
-     * A full batch or a failed send on shutdown hands chunks back to the
-     * engine with FLB_RETRY: once retry_limit is reached they are dropped.
-     */
-    if (ctx->batch_interval > 0 &&
-        (ctx->batch_hold_chunks || ctx->batch_max_size > 0) &&
-        ins->retry_limit != FLB_OUT_RETRY_UNLIMITED) {
-        flb_plg_warn(ctx->ins, "chunks handed back for retry (full batch or "
-                     "failed send on shutdown) are dropped once 'retry_limit' "
-                     "(%i) is reached, consider 'retry_limit no_limits'",
-                     ins->retry_limit);
-    }
-
     /* Date format for JSON output */
     ctx->json_date_format = FLB_PACK_JSON_DATE_DOUBLE;
     tmp = flb_output_get_property("json_date_format", ins);
@@ -516,9 +425,6 @@ void flb_http_conf_destroy(struct flb_out_http *ctx)
          * owned by the config map, so we shouldn't free them either.
          */
     }
-
-    flb_sds_destroy(ctx->batch_buf);
-    flb_sds_destroy(ctx->batch_tag);
 
     flb_free(ctx->proxy_host);
     flb_free(ctx->uri);
