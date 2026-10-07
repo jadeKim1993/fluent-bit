@@ -7,11 +7,9 @@ fluent-bit `http` output 에 추가한 기능을 **어떻게 설정하고, 어�
 | JSON 봉투 | 요청 본문을 `{"count":N,"events":[...]}` 형태로 | `json_events_key`, `json_count_key` |
 | 주기 배치 | 로그를 모았다가 **주기마다 요청 1건**으로 전송 | `batch_interval`, `batch_max_size` |
 | 유실 방지 | 전송이 성공해야만 버퍼(청크 파일)를 삭제 | `batch_hold_chunks` + `storage.type: filesystem` |
-| 결과 이벤트 | 주기마다 성공/실패/빈 주기를 레코드로 남겨 **PostgreSQL 에 저장** | `batch_status_tag` + `pgsql` output |
 
 ```
 tail ─▶ 청크 ─▶ out_http ──(5분 동안 모음)──▶ POST 1건 {"count":1234,"events":[...]}
-                              └──(주기마다 결과)──▶ pgsql ──▶ PostgreSQL
 ```
 
 ---
@@ -151,15 +149,13 @@ out_http 안의 타이머가 **1초마다 "주기가 됐나?"를 확인**합니�
 | `batch_hold_chunks` | `off` | `on` 이면 전송 성공 후에만 청크 삭제 (6장) |
 | `batch_hold_max_chunks` | `512` | 유실 방지 모드에서 한 번에 붙잡는 청크 수 상한. 넘는 청크는 디스크에서 대기 후 이후 주기에 전송. `0` 은 무제한 (6.5) |
 | `batch_retry_4xx` | `off` | `on` 이면 4xx 로 거부된 배치도 폐기하지 않고 다음 주기에 재전송 (413 은 설정과 무관하게 항상 보관) |
-| `batch_status_tag` | 없음 | 배치 결과 이벤트의 태그. 켜면 요청에 `X-Batch-Id` 헤더가 붙음 (8장) |
-| `batch_status_storage.type` | `memory` | 결과 이벤트 저장 방식 `memory` / `filesystem` |
 
 ### 4.2 함께 쓰면 좋은 옵션
 
 | 옵션 | 위치 | 설명 |
 |------|------|------|
 | `workers` | `outputs` | 배치 모드는 **1로 고정**됩니다 (2 이상이면 경고 후 1). `0` 도 동작 |
-| `retry_limit` | `outputs` | `batch_max_size` 나 `batch_hold_chunks` 를 쓰면 **`no_limits` 권장** (9.3) |
+| `retry_limit` | `outputs` | `batch_max_size` 나 `batch_hold_chunks` 를 쓰면 **`no_limits` 권장** (8.3) |
 | `grace` | `service` | 종료 시 대기 시간 (기본 5초). `30` 정도 권장 |
 | `compress` | `outputs` | `gzip` — 한 주기 분량이 클 때 |
 | `json_date_key` / `json_date_format` | `outputs` | 각 이벤트의 시간 필드 이름(`false` 면 생략) / `double`, `epoch`, `iso8601`, `java_sql_timestamp` |
@@ -401,7 +397,7 @@ pipeline:
 |------|------|--------|
 | 수신 서버 장애가 여러 시간 지속 | 주기마다 1회(+즉시 재시도) 시도, 실패하면 보관. 배치가 `batch_max_size`/`batch_hold_max_chunks` 에 차면 나머지는 디스크에서 대기 | 유실 없음. 복구 후 첫 주기에 한도만큼, 나머지는 이후 주기와 엔진 재시도로 전송 |
 | 413 Payload Too Large | 보관, 매 주기 에러 로그 (`set 'batch_max_size' below the receiver limit`) | 유실 없음. `batch_max_size` 를 줄이고 재시작하면 나눠서 전송 |
-| 401/403 등 4xx | 기본: **그 배치 폐기** (에러 로그 `... are lost`, 결과 이벤트 `dropped`) | `batch_retry_4xx: on` 이면 보관 후 복구되면 전송 |
+| 401/403 등 4xx | 기본: **그 배치 폐기** (에러 로그 `... are lost`) | `batch_retry_4xx: on` 이면 보관 후 복구되면 전송 |
 | kill -9 / crash | 디스크의 청크를 재시작 후 다시 보냄 | 유실 없음 (at-least-once) |
 | 재시작 후 backlog | 디스크의 청크를 몇 초 안에 다시 읽어 붙잡음 (`storage.backlog.mem_limit` 은 1회 로딩량만 제한, 16K 로 줄여도 첫 주기에 전량 전송됨을 확인). **첫 전송은 재시작 후 한 주기 뒤** | 유실 없음. 한 번에 보내는 양은 `batch_max_size`/`batch_hold_max_chunks` 까지, 나머지는 이후 주기 |
 | 응답하지 않는 수신 서버에서 종료 | 종료 중 1회만 시도, `http.response_timeout` 뒤 포기 | 유실 없음 (재시작 후 전송). 종료 시간 ≈ grace + response_timeout |
@@ -410,7 +406,6 @@ pipeline:
 - 주기마다 info 로그 1줄: `batch <id> sent: N records (M chunks), B bytes, HTTP 200, 1 attempt(s), T ms`
 - 실패: warn `batch <id> failed: <원인>; N records (M chunks) kept in storage for the next interval in 3600s`
 - 가득 참: warn `batch is full (...)` — 주기당 1번
-- 결과 이벤트(8장)를 켜면 성공/실패/빈 주기가 DB 에 1행씩 남습니다. `retry_next_interval` 이 연속되면 알림을 거세요.
 
 ---
 
@@ -468,154 +463,9 @@ input 청크 1개 ──┬─▶ batch_out  : 배치 대기 중 (표시 유지)
 
 ---
 
-## 8. 결과 이벤트를 PostgreSQL 에 기록하기 (`batch_status_tag`)
+## 8. 운영 가이드
 
-주기마다 배치 결과를 **레코드 1건**으로 만들어 파이프라인에 넣습니다. `pgsql` output 으로 보내면 DB 에 이력이 쌓입니다.
-
-### 8.1 동작
-```
-out_http (배치) ──POST (X-Batch-Id 헤더)──▶ 수집 서버
-      │ ① 주기마다 결과 레코드 생성
-      ▼
-결과 전용 입력 (<output 이름>_batch_status, 자동 생성)
-      │ ② 스레드 간 큐 → 엔진이 250ms 마다 청크로 저장
-      ▼
-태그 batch.status ─▶ pgsql ──INSERT──▶ PostgreSQL     ③ 일반 로그처럼 라우팅·재시도
-```
-DB 가 느리거나 죽어도 **로그 배치 전송에는 영향이 없습니다.**
-
-### 8.2 설정
-```yaml
-service:
-  storage.path: /var/lib/fluent-bit/storage   # batch_status_storage.type: filesystem 일 때
-
-pipeline:
-  inputs:
-    - name: tail
-      path: /var/log/app/*.log
-      tag: app
-
-  outputs:
-    - name: http
-      alias: batch_out
-      match: app
-      host: collector.example.com
-      port: 8080
-      format: json
-      json_events_key: events
-      batch_interval: 5m
-      batch_max_size: 50M
-      batch_status_tag: batch.status              # 결과 이벤트 태그
-      batch_status_storage.type: filesystem       # DB 장애 대비 디스크 보관
-      workers: 1
-
-    - name: pgsql
-      match: batch.status
-      host: db.example.com
-      port: 5432
-      user: fluent
-      password: ${PG_PASSWORD}
-      database: logs
-      table: batch_events
-      retry_limit: no_limits
-```
-
-### 8.3 `status` — 주기마다 1건
-| `status` | 언제 |
-|----------|------|
-| `success` | 전송 성공 (`attempts` 1, 즉시 재시도 후 성공이면 2) |
-| `empty` | 주기가 되어 전송을 시도했지만 **보낼 데이터가 없음** |
-| `retry_next_interval` | 즉시 재시도까지 실패 → 다음 주기에 합쳐 재전송 |
-| `dropped` | 4xx 거부 등으로 폐기 |
-| `failed_on_shutdown` | 종료 중 전송 실패 (grace 동안 1초마다 재시도하므로 여러 건 가능) |
-
-### 8.4 필드
-| 필드 | 설명 | 예 |
-|------|------|----|
-| `batch_id` | `<output>-<시작 epoch 초>-<순번>-<프로세스별 난수>`. 요청 헤더 `X-Batch-Id` 와 같은 값 | `batch_out-1790769024-1-43e90ed6` |
-| `output` | output 이름 (alias 우선) | `batch_out` |
-| `status` | 8.3 | `success` |
-| `http_status` | 응답 코드, 응답 없으면 null | `201` |
-| `records` | 보낸(보내려던) 레코드 수 | `1234` |
-| `carried_over_records` | 이전 주기 실패로 이월되어 합쳐진 수 | `980` |
-| `bytes` | 요청 본문 크기 (압축 전) | `88213` |
-| `attempts` | HTTP 요청 횟수 (0~2) | `1` |
-| `started_at` | 전송 시작 시각 (ISO 8601 UTC) | `2026-09-30T11:50:24.218Z` |
-| `duration_ms` | 전송에 걸린 시간 | `4` |
-| `first_record_time` / `last_record_time` | 배치 첫/마지막 레코드 시각, 없으면 null | `2026-09-30T11:50:22.059Z` |
-| `error` | 실패 사유, 없으면 null | `no connection available to 10.0.0.5:8080` |
-
-`error` 값 예: `no connection available to <host>:<port>`, `request to <host>:<port> failed (connection error or timeout)`, `HTTP status <code>`, `could not compose the payload`, `out of memory while keeping the batch`.
-
-### 8.5 PostgreSQL 에 저장되는 모양
-`pgsql` output 이 테이블을 자동으로 만들며 구조는 고정입니다. 필드는 전부 `data`(jsonb) 에 들어가므로 **컬럼을 맞출 필요가 없습니다.**
-
-```sql
-CREATE TABLE IF NOT EXISTS batch_events (tag varchar, time timestamp, data jsonb);  -- 자동 생성
-```
-| 컬럼 | 값 |
-|------|----|
-| `tag` | `batch.status` |
-| `time` | 이벤트 생성 시각 (DB 세션 타임존 기준) |
-| `data` | 8.4 필드 전체 + `date`(epoch) |
-
-조회:
-```sql
--- 실패/이상 이벤트
-SELECT time, data->>'batch_id', data->>'status', data->>'error'
-FROM batch_events
-WHERE data->>'status' NOT IN ('success', 'empty')
-ORDER BY time DESC;
-
--- 하루 동안 보낸 레코드 수
-SELECT sum((data->>'records')::int)
-FROM batch_events
-WHERE data->>'status' = 'success' AND time > now() - interval '1 day';
-```
-
-컬럼처럼 쓰는 뷰:
-```sql
-CREATE VIEW batch_events_v AS
-SELECT
-  time                                        AS event_time,
-  data->>'batch_id'                           AS batch_id,
-  data->>'output'                             AS output,
-  data->>'status'                             AS status,
-  (data->>'http_status')::int                 AS http_status,
-  (data->>'records')::int                     AS records,
-  (data->>'carried_over_records')::int        AS carried_over_records,
-  (data->>'bytes')::bigint                    AS bytes,
-  (data->>'attempts')::int                    AS attempts,
-  (data->>'started_at')::timestamptz          AS started_at,
-  (data->>'duration_ms')::int                 AS duration_ms,
-  (data->>'first_record_time')::timestamptz   AS first_record_time,
-  (data->>'last_record_time')::timestamptz    AS last_record_time,
-  data->>'error'                              AS error
-FROM batch_events;
-
-CREATE INDEX ON batch_events (time);
-CREATE INDEX ON batch_events ((data->>'status'));
-```
-
-### 8.6 수신 서버 기록과 맞춰 보기
-결과 이벤트를 켜면 요청에 `X-Batch-Id` 헤더가 붙습니다. 수신 서버가 이 값을 저장하면
-"보냈다(이벤트)" ↔ "받았다(수신 서버)" 를 `batch_id` 로 조인할 수 있습니다.
-
-### 8.7 알아둘 점
-| 항목 | 내용 |
-|------|------|
-| 필요한 플러그인 | 결과 전용 입력으로 `emitter` 입력 플러그인 사용 (`FLB_IN_EMITTER`, 공식 빌드 기본 포함). 없으면 시작 시 오류 |
-| 루프 방지 | 결과 태그가 배치 output 자신의 `match` 에 걸리면 **시작을 거부** |
-| `match: '*'` 인 다른 output | 결과 이벤트도 받게 되므로 `match` 를 구체적으로 |
-| 지연 | 결과 생성 → 최대 250ms → `flush` 주기 → insert |
-| 기록 누락 가능성 | 전송 직후 ~250ms 안에 죽으면 그 이벤트가 빠질 수 있음. `filesystem` 저장 권장, 정확한 대조는 8.6 |
-| 종료 시 | grace 동안은 이벤트가 생성·전달됨. 엔진이 멈춘 뒤의 마지막 전송은 이벤트를 남기지 않음 |
-
----
-
-## 9. 운영 가이드
-
-### 9.1 상황별 동작
+### 8.1 상황별 동작
 | 상황 | 기본 배치 | 유실 방지 |
 |------|-----------|-----------|
 | 주기 도래 | 요청 1건 | 요청 1건 → 성공 시 청크 삭제 |
@@ -628,7 +478,7 @@ CREATE INDEX ON batch_events ((data->>'status'));
 | SIGTERM | 1초 내 즉시 전송 | 1초 내 즉시 전송, 성공 시 청크 삭제 |
 | kill -9 / crash | 최대 한 주기 유실 | 재시작 후 재전송 |
 
-### 9.2 로그로 확인하기
+### 8.2 로그로 확인하기
 | 로그 | 의미 / 조치 |
 |------|-------------|
 | `batch mode enabled, sending every 3600s, chunks held until delivered (batch_max_size .., batch_hold_max_chunks ..)` | 배치 모드와 주요 한도 (info) |
@@ -642,22 +492,20 @@ CREATE INDEX ON batch_events ((data->>'status'));
 | `about N chunks per tag are flushed in one batch_interval ... consider a larger 'flush'` | 시작 시 점검: 한 주기 청크 수가 상한 초과 |
 | `'batch_max_size' is not set: a whole Ns interval goes in a single request` | 시작 시 점검: 긴 주기인데 크기 한도 없음 |
 | `'batch_interval' requires a single worker, setting 'workers' to 1` | `workers: 1` 명시하면 사라짐 |
-| `chunks handed back for retry ... consider 'retry_limit no_limits'` | 9.3 참고 |
+| `chunks handed back for retry ... consider 'retry_limit no_limits'` | 8.3 참고 |
 | `'batch_interval' is not supported with 'body_key'` | `body_key` 와 함께 사용 불가 |
-| `'batch_status_tag' ... is matched by this output` | 결과 태그가 자기 match 에 걸림 → 태그나 match 수정 |
-| `cannot create the batch status input ... (FLB_IN_EMITTER)` | emitter 플러그인 없는 빌드 |
 
-### 9.3 `retry_limit` 을 `no_limits` 로 권장하는 이유
+### 8.3 `retry_limit` 을 `no_limits` 로 권장하는 이유
 배치가 가득 찼을 때(`batch_max_size`)와 유실 방지 모드에서 종료 중 전송이 실패했을 때는 청크를 엔진에 돌려보내 재시도하게 합니다.
 기본 `retry_limit`(1)이면 두 번째 실패에서 엔진이 그 청크를 **삭제**하므로, 해당 옵션을 쓸 때는 `no_limits` 로 두세요.
 
-### 9.4 엔진 메트릭 주의
+### 8.4 엔진 메트릭 주의
 배치 기본 모드는 버퍼에 넣는 순간 엔진에 "성공"을 알리므로, 엔진 메트릭(`fluentbit_output_proc_records_total`)은 **실제 전송 전에** 성공으로 집계됩니다.
-실제 전송 결과는 로그나 결과 이벤트(8장)로 확인하세요.
+실제 전송 결과는 주기마다 남는 로그(`batch <id> sent: ...`)로 확인하세요.
 
 ---
 
-## 10. 자주 묻는 질문
+## 9. 자주 묻는 질문
 
 **Q. `flush` 를 `batch_interval` 과 같게 맞춰야 하나요?**
 아니요. 기본 모드는 설정하지 않는 것이 가장 좋고, 유실 방지 모드는 5~10초면 됩니다 (3장, 6.3).
@@ -679,7 +527,7 @@ CREATE INDEX ON batch_events ((data->>'status'));
 
 ---
 
-## 11. 제약
+## 10. 제약
 
 - `workers` 는 1 고정, `body_key` 모드와 함께 쓸 수 없음
 - 주기는 시작 시점 기준 (정각 정렬 아님)
@@ -688,7 +536,7 @@ CREATE INDEX ON batch_events ((data->>'status'));
 
 ---
 
-## 12. 빌드 메모
+## 11. 빌드 메모
 
 ```bash
 mkdir -p build && cd build
@@ -702,26 +550,19 @@ make -j8 fluent-bit-bin flb-rt-out_http
 | macOS 최신 SDK 에서 c-ares `pipe2` 오류 | `-DHAVE_PIPE2=0` |
 | `rdkafka.h` 없음 | `-DFLB_KAFKA=Off` |
 | macOS 에 pkg-config 가 없어 libyaml 미검출 | `-DFLB_LIBYAML_DIR=/opt/homebrew` |
-| 결과 이벤트 (`FLB_MINIMAL` 빌드) | `-DFLB_IN_EMITTER=On` |
-| `pgsql` output | `libpq` 개발 패키지 필요 (Ubuntu: `libpq-dev`). 없으면 `FLB_OUT_PGSQL` 이 **조용히 꺼짐** |
 
 ---
 
-## 13. 검증 요약
+## 12. 검증 요약
 
-### 런타임 테스트 (`tests/runtime/out_http.c`, 28개 통과)
+### 런타임 테스트 (`tests/runtime/out_http.c`, 22개 통과)
 | 테스트 | 내용 |
 |--------|------|
 | `json_events_key`, `_count_key`, `_disable_count` | 봉투 형식, 개수 키 변경/생략 |
 | `batch_interval`, `batch_hold_chunks` | 여러 flush 에 걸친 3건 → 수신측 요청 **정확히 1건**, `"count":3` (기본 / 유실 방지) |
 | `..._no_workers` | 위 두 테스트를 `workers: 0` 으로 |
-| `batch_status_events`, `_hold` | `success` 1건 + 빈 주기 `empty` |
-| `batch_status_retry` | 실패 시 `retry_next_interval` (attempts 2, error 포함) |
-| `batch_status_tag_loop` | 결과 태그 루프 시 시작 거부 |
-| `batch_413_kept` | 수신 서버가 413 → 폐기하지 않고 `retry_next_interval` (http 413) |
-| `batch_hold_max_chunks` | 상한 2 로 청크 5개 → 첫 배치 2청크 이하, 나머지도 유실 없이 전송 |
 
-배치 기능을 끄거나(요청 3건으로 실패) 빈 주기 이벤트 생성을 빼면(실패) 테스트가 실패하는 것도 확인했습니다.
+배치 기능을 끄면 요청 3건으로 테스트가 실패하는 것도 확인했습니다 (테스트가 실제 동작을 검증함).
 
 ### 실제 바이너리 E2E
 | 시나리오 | 환경 | 결과 |
@@ -739,5 +580,4 @@ make -j8 fluent-bit-bin flb-rt-out_http
 | 크래시 후 재시작 backlog (`storage.backlog.mem_limit` 16K / 100M) | Linux | 둘 다 재시작 후 첫 주기에 전량 전송, 유실 0 |
 | `batch_hold_max_chunks` 5 초과 (주기당 청크 약 20개) | Linux | 배치당 5청크 이하, 나머지는 이후 주기에 유실 0 |
 | 연결만 받고 응답하지 않는 서버에서 SIGTERM | Linux | 13초에 종료 (grace 10 + response_timeout 5 이내), 재시작 후 전송 |
-| 결과 이벤트 → PostgreSQL 16 (`pgsql`) | Linux | success → empty → retry ×2 (carried 2) → success 5행 insert, 8.5 의 뷰·조회 SQL 동작 |
 
