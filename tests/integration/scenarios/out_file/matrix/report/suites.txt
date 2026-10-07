@@ -1,0 +1,6 @@
+runtime|flb-rt-out_file_uuid|16|SUCCESS: All unit tests have passed.
+runtime|flb-rt-out_file|21|SUCCESS: All unit tests have passed.
+runtime|flb-rt-out_file_rotation|25|SUCCESS: All unit tests have passed.
+runtime|flb-rt-out_http|15|SUCCESS: All unit tests have passed.
+integration|out_file (일반)|5|5 passed, 5 warnings in 42.21s
+integration|out_file (macOS Leaks)|5|4 passed, 1 skipped, 5 warnings in 29.03s

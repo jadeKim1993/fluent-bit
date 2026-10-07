@@ -1,0 +1,5 @@
+{
+ "commit": "baeb4ede7 out_file: add uuid_file option for one UUIDv7 file per flush",
+ "platform": "Darwin arm64",
+ "date": "2026-10-07"
+}

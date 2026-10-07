@@ -1,0 +1,551 @@
+[
+ {
+  "id": "A01",
+  "category": "설정 검증",
+  "title": "path 미지정",
+  "expected": "기동 거부",
+  "status": "PASS",
+  "detail": "기동 거부 (rc=255): [output:file:file.0] 'path' is required when uuid_file is enabled",
+  "seconds": 0.1
+ },
+ {
+  "id": "A02",
+  "category": "설정 검증",
+  "title": "path가 일반 파일",
+  "expected": "기동 거부",
+  "status": "PASS",
+  "detail": "기동 거부 (rc=255): [output:file:file.0] path A02/afile is not a directory",
+  "seconds": 0.1
+ },
+ {
+  "id": "A03",
+  "category": "설정 검증",
+  "title": "없는 디렉토리 + mkdir off",
+  "expected": "기동 거부",
+  "status": "PASS",
+  "detail": "기동 거부 (rc=255): [output:file:file.0] path A03/nope is not a directory",
+  "seconds": 0.1
+ },
+ {
+  "id": "A04",
+  "category": "설정 검증",
+  "title": "없는 중첩 디렉토리 + mkdir on",
+  "expected": "디렉토리 생성 후 정상 기록",
+  "status": "PASS",
+  "detail": "/a/b/c 생성, 파일 1개",
+  "seconds": 0.3
+ },
+ {
+  "id": "A05",
+  "category": "설정 검증",
+  "title": "file 옵션과 함께 사용",
+  "expected": "기동 거부",
+  "status": "PASS",
+  "detail": "기동 거부 (rc=255): [output:file:file.0] 'file' cannot be used with uuid_file",
+  "seconds": 0.1
+ },
+ {
+  "id": "A06",
+  "category": "설정 검증",
+  "title": "rotate on과 함께 사용",
+  "expected": "기동 거부",
+  "status": "PASS",
+  "detail": "기동 거부 (rc=255): [output:file:file.0] 'rotate' cannot be used with uuid_file",
+  "seconds": 0.1
+ },
+ {
+  "id": "A07",
+  "category": "설정 검증",
+  "title": "path에 레코드 접근자($field)",
+  "expected": "기동 거부",
+  "status": "PASS",
+  "detail": "기동 거부 (rc=255): [output:file:file.0] record accessors in 'path' cannot be used with uuid_file",
+  "seconds": 0.1
+ },
+ {
+  "id": "A08",
+  "category": "설정 검증",
+  "title": "uuid_file_prefix에 경로 구분자 (a/b)",
+  "expected": "기동 거부",
+  "status": "PASS",
+  "detail": "기동 거부 (rc=255): [output:file:file.0] 'uuid_file_prefix' must not contain path separators",
+  "seconds": 0.1
+ },
+ {
+  "id": "A09",
+  "category": "설정 검증",
+  "title": "uuid_file_prefix에 경로 구분자 (a\\b)",
+  "expected": "기동 거부",
+  "status": "PASS",
+  "detail": "기동 거부 (rc=255): [output:file:file.0] 'uuid_file_prefix' must not contain path separators",
+  "seconds": 0.1
+ },
+ {
+  "id": "A10",
+  "category": "설정 검증",
+  "title": "uuid_file_extension = '.tmp'",
+  "expected": "기동 거부 (.tmp로 끝남)",
+  "status": "PASS",
+  "detail": "기동 거부 (rc=255): [output:file:file.0] 'uuid_file_extension' must not end with '.tmp'",
+  "seconds": 0.1
+ },
+ {
+  "id": "A11",
+  "category": "설정 검증",
+  "title": "uuid_file_extension = 'tmp'",
+  "expected": "기동 거부 (.tmp로 끝남)",
+  "status": "PASS",
+  "detail": "기동 거부 (rc=255): [output:file:file.0] 'uuid_file_extension' must not end with '.tmp'",
+  "seconds": 0.1
+ },
+ {
+  "id": "A12",
+  "category": "설정 검증",
+  "title": "uuid_file_extension = '.log.tmp'",
+  "expected": "기동 거부 (.tmp로 끝남)",
+  "status": "PASS",
+  "detail": "기동 거부 (rc=255): [output:file:file.0] 'uuid_file_extension' must not end with '.tmp'",
+  "seconds": 0.1
+ },
+ {
+  "id": "A13",
+  "category": "설정 검증",
+  "title": "uuid_file_extension에 '/' 포함",
+  "expected": "기동 거부",
+  "status": "PASS",
+  "detail": "기동 거부 (rc=255): [output:file:file.0] 'uuid_file_extension' must not contain path separators",
+  "seconds": 0.1
+ },
+ {
+  "id": "A14",
+  "category": "설정 검증",
+  "title": "uuid_file_tmp_max_age = 'off'",
+  "expected": "기동 거부 (숫자로 시작해야 함)",
+  "status": "PASS",
+  "detail": "기동 거부 (rc=255): [output:file:file.0] invalid uuid_file_tmp_max_age 'off', expected a time such as 600, 30s, 10m or 1h",
+  "seconds": 0.1
+ },
+ {
+  "id": "A15",
+  "category": "설정 검증",
+  "title": "uuid_file_tmp_max_age = 'abc'",
+  "expected": "기동 거부 (숫자로 시작해야 함)",
+  "status": "PASS",
+  "detail": "기동 거부 (rc=255): [output:file:file.0] invalid uuid_file_tmp_max_age 'abc', expected a time such as 600, 30s, 10m or 1h",
+  "seconds": 0.1
+ },
+ {
+  "id": "A16",
+  "category": "설정 검증",
+  "title": "uuid_file_tmp_max_age = '-1'",
+  "expected": "기동 거부 (숫자로 시작해야 함)",
+  "status": "PASS",
+  "detail": "기동 거부 (rc=255): [output:file:file.0] invalid uuid_file_tmp_max_age '-1', expected a time such as 600, 30s, 10m or 1h",
+  "seconds": 0.1
+ },
+ {
+  "id": "A17",
+  "category": "설정 검증",
+  "title": "uuid_file_tmp_max_age = ' 10m' (앞 공백)",
+  "expected": "공백 제거 후 10m로 기동",
+  "status": "PASS",
+  "detail": "설정 파서가 앞뒤 공백을 제거해 10m로 처리",
+  "seconds": 2.5
+ },
+ {
+  "id": "A18",
+  "category": "설정 검증",
+  "title": "uuid_file_tmp_max_age 정상값 0/30/30s/10m/1h/1d",
+  "expected": "모두 기동 성공",
+  "status": "PASS",
+  "detail": "6개 값 모두 기동 성공",
+  "seconds": 9.1
+ },
+ {
+  "id": "A19",
+  "category": "설정 검증",
+  "title": "uuid_file 값이 잘못된 bool ('maybe')",
+  "expected": "기동 거부",
+  "status": "PASS",
+  "detail": "기동 거부 (rc=255)",
+  "seconds": 0.1
+ },
+ {
+  "id": "A20",
+  "category": "설정 검증",
+  "title": "경로+접두사가 PATH_MAX 초과",
+  "expected": "기동 거부",
+  "status": "PASS",
+  "detail": "기동 거부 (rc=255): [output:file:file.0] path, uuid_file_prefix and uuid_file_extension are too long",
+  "seconds": 0.1
+ },
+ {
+  "id": "A21",
+  "category": "설정 검증",
+  "title": "path 끝에 '/' 여러 개",
+  "expected": "정상 기록, 이름에 '//' 없음",
+  "status": "PASS",
+  "detail": "path=A21/out",
+  "seconds": 0.3
+ },
+ {
+  "id": "A22",
+  "category": "설정 검증",
+  "title": "uuid_file off (기본값)",
+  "expected": "기존 out_file 동작 유지 (태그 이름 파일)",
+  "status": "PASS",
+  "detail": "app.log 1개만 생성 (UUID 파일 없음)",
+  "seconds": 0.3
+ },
+ {
+  "id": "B01",
+  "category": "파일 생성·이름",
+  "title": "레코드 1건",
+  "expected": "파일 1개, UUIDv7 이름, tmp 없음",
+  "status": "PASS",
+  "detail": "01a11657-6eb4-70cf-a7b8-bdf36f1600e4.log",
+  "seconds": 0.3
+ },
+ {
+  "id": "B02",
+  "category": "파일 생성·이름",
+  "title": "파일 권한",
+  "expected": "0640 (umask 022 기준), 기타 사용자 접근 불가",
+  "status": "PASS",
+  "detail": "권한 0o640",
+  "seconds": 0.3
+ },
+ {
+  "id": "B03",
+  "category": "파일 생성·이름",
+  "title": "접두사 + 점 없는 확장자 (relay-, jsonl)",
+  "expected": "relay-<uuid>.jsonl",
+  "status": "PASS",
+  "detail": "relay-01a11657-7133-78f4-8740-943ba5c319ad.jsonl",
+  "seconds": 0.3
+ },
+ {
+  "id": "B04",
+  "category": "파일 생성·이름",
+  "title": "빈 확장자",
+  "expected": "<uuid> (확장자 없음)",
+  "status": "PASS",
+  "detail": "01a11657-727a-7ae1-bc20-409bb0dcd119",
+  "seconds": 0.3
+ },
+ {
+  "id": "B05",
+  "category": "파일 생성·이름",
+  "title": "이름 정렬 = 생성 순서 (20개 파일)",
+  "expected": "정렬 순서와 기록 순서 일치",
+  "status": "PASS",
+  "detail": "파일 20개, 정렬 순서 = seq-000..seq-019",
+  "seconds": 6.4
+ },
+ {
+  "id": "B06",
+  "category": "파일 생성·이름",
+  "title": "UUID 안의 시각",
+  "expected": "파일 생성 시각과 ±2초 이내",
+  "status": "PASS",
+  "detail": "UUID 시각과 mtime 차이 1ms",
+  "seconds": 0.3
+ },
+ {
+  "id": "B07",
+  "category": "파일 생성·이름",
+  "title": "uuid_file_fsync off",
+  "expected": "정상 기록",
+  "status": "PASS",
+  "detail": "레코드 50개, 파일 3개",
+  "seconds": 0.6
+ },
+ {
+  "id": "C01",
+  "category": "출력 포맷",
+  "title": "기본 포맷 (format 미지정)",
+  "expected": "'태그: [시각, {레코드}]' 형식",
+  "status": "PASS",
+  "detail": "app.log: [1791376200.603446000, {\"message\":\"hi\"}]",
+  "seconds": 2.1
+ },
+ {
+  "id": "C02",
+  "category": "출력 포맷",
+  "title": "plain",
+  "expected": "JSON Lines",
+  "status": "PASS",
+  "detail": "{\"message\": \"hi\", \"n\": 1, \"nested\": {\"k\": [1, 2]}}",
+  "seconds": 1.1
+ },
+ {
+  "id": "C03",
+  "category": "출력 포맷",
+  "title": "csv",
+  "expected": "시각,값,값",
+  "status": "PASS",
+  "detail": "1791376203.745002000,1,\"x\"",
+  "seconds": 2.1
+ },
+ {
+  "id": "C04",
+  "category": "출력 포맷",
+  "title": "csv + csv_column_names (파일 2개)",
+  "expected": "모든 파일 첫 줄이 헤더",
+  "status": "PASS",
+  "detail": "파일 2개 모두 헤더: timestamp,\"log\"",
+  "seconds": 1.9
+ },
+ {
+  "id": "C05",
+  "category": "출력 포맷",
+  "title": "ltsv",
+  "expected": "\"time\":... 탭 구분 레이블",
+  "status": "PASS",
+  "detail": "\"time\":1791376207.770074\\t\"a\":1",
+  "seconds": 2.1
+ },
+ {
+  "id": "C06",
+  "category": "출력 포맷",
+  "title": "template ({message} by {user})",
+  "expected": "템플릿 치환",
+  "status": "PASS",
+  "detail": "hi by kim",
+  "seconds": 2.1
+ },
+ {
+  "id": "C07",
+  "category": "출력 포맷",
+  "title": "msgpack",
+  "expected": "원본 청크 그대로 (배열로 시작)",
+  "status": "PASS",
+  "detail": "17 bytes, 첫 바이트 0x92",
+  "seconds": 2.1
+ },
+ {
+  "id": "C08",
+  "category": "출력 포맷",
+  "title": "메트릭 입력 (fluentbit_metrics)",
+  "expected": "메트릭 텍스트 파일 생성",
+  "status": "PASS",
+  "detail": "메트릭 46줄",
+  "seconds": 2.1
+ },
+ {
+  "id": "C09",
+  "category": "출력 포맷",
+  "title": "한글·이모지·특수문자 (기본 설정)",
+  "expected": "유효한 JSON, 파싱 결과 원문과 동일 (한글은 \\uXXXX로 이스케이프)",
+  "status": "PASS",
+  "detail": "파싱 결과 동일, 파일 원문: {\"msg\":\"\\uc548\\ub155\\ud558\\uc138\\uc694 \\ud83d\\...",
+  "seconds": 2.1
+ },
+ {
+  "id": "C10",
+  "category": "출력 포맷",
+  "title": "한글·이모지·특수문자 (json.escape_unicode: off)",
+  "expected": "UTF-8 원문 그대로 기록, 파싱 결과 동일",
+  "status": "PASS",
+  "detail": "파일 원문: {\"msg\":\"안녕하세요 🚀 \\\"quoted\\\" back\\\\slash\\n...",
+  "seconds": 2.1
+ },
+ {
+  "id": "C11",
+  "category": "출력 포맷",
+  "title": "1MB 크기 레코드",
+  "expected": "내용 손상 없음",
+  "status": "PASS",
+  "detail": "1,048,587 bytes 일치",
+  "seconds": 2.5
+ },
+ {
+  "id": "D01",
+  "category": "동작",
+  "title": "로그가 들어오지 않음 (8초 대기)",
+  "expected": "파일 0개",
+  "status": "PASS",
+  "detail": "8초간 파일 0개, tmp 0개",
+  "seconds": 8.0
+ },
+ {
+  "id": "D02",
+  "category": "동작",
+  "title": "필터가 모든 레코드 제거 (grep exclude)",
+  "expected": "파일 0개, tmp 0개",
+  "status": "PASS",
+  "detail": "4초간 레코드 ~80건 유입, 파일 0개",
+  "seconds": 4.0
+ },
+ {
+  "id": "D03",
+  "category": "동작",
+  "title": "빈 출력 청크 (csv에 빈 레코드)",
+  "expected": "파일 만들지 않음",
+  "status": "PASS",
+  "detail": "레코드 10건(내용 없음) → 파일 0개",
+  "seconds": 3.0
+ },
+ {
+  "id": "D04",
+  "category": "동작",
+  "title": "태그 3개 동시 입력",
+  "expected": "태그별 파일, 한 파일에 섞이지 않음",
+  "status": "PASS",
+  "detail": "파일 18개, 레코드 300건, 섞인 파일 0개",
+  "seconds": 1.3
+ },
+ {
+  "id": "D05",
+  "category": "동작",
+  "title": "output 2개가 같은 디렉토리",
+  "expected": "각자 사본, 덮어쓰기 없음",
+  "status": "PASS",
+  "detail": "파일 10개, 레코드 200건 (100 × 2)",
+  "seconds": 1.1
+ },
+ {
+  "id": "D06",
+  "category": "동작",
+  "title": "workers 8 + 입력 16개",
+  "expected": "레코드 정확히 1번씩",
+  "status": "PASS",
+  "detail": "파일 295개, 입력별 200건 × 16",
+  "seconds": 6.3
+ },
+ {
+  "id": "D07",
+  "category": "동작",
+  "title": "시작 시 tmp 정리 (7가지 파일)",
+  "expected": "자기 패턴의 오래된 tmp만 삭제",
+  "status": "PASS",
+  "detail": "삭제 1 (자기 패턴·1시간 전) / 유지 6 (최근·다른 접두사·다른 확장자·무관·완성·디렉토리)",
+  "seconds": 2.5
+ },
+ {
+  "id": "D08",
+  "category": "동작",
+  "title": "기존 완성 파일 300개가 있는 디렉토리",
+  "expected": "기존 파일 내용 변화 없음",
+  "status": "PASS",
+  "detail": "기존 300개 보존, 새 파일 6개",
+  "seconds": 1.4
+ },
+ {
+  "id": "D09",
+  "category": "동작",
+  "title": "쓰기 중 디렉토리 삭제 → 재생성 (retry_limit no_limits)",
+  "expected": "재시도 후 정확히 1번 기록",
+  "status": "PASS",
+  "detail": "실패 2회 후 전달, 레코드 1건, tmp 0개",
+  "seconds": 6.7
+ },
+ {
+  "id": "D10",
+  "category": "동작",
+  "title": "디렉토리 쓰기 권한 제거 → 복구",
+  "expected": "재시도 후 정확히 1번 기록",
+  "status": "PASS",
+  "detail": "권한 없는 동안 파일 0개 → 복구 후 1건, 실패 로그 1회",
+  "seconds": 4.7
+ },
+ {
+  "id": "D11",
+  "category": "동작",
+  "title": "retry_limit 기본값(1)에서 계속 실패",
+  "expected": "청크 폐기 (설정 주의 사항 확인)",
+  "status": "PASS",
+  "detail": "재시도 1회 후 폐기 → 중계 용도는 retry_limit: no_limits 필요",
+  "seconds": 6.7
+ },
+ {
+  "id": "D12",
+  "category": "동작",
+  "title": "flush 전 종료 → 재시작 (storage.type: filesystem)",
+  "expected": "종료 때 못 쓴 500건이 재시작 후 모두 기록",
+  "status": "PASS",
+  "detail": "종료 시점 기록 0건 → 재시작 후 500건 모두 기록 (+ 새 데이터 1건)",
+  "seconds": 4.6
+ },
+ {
+  "id": "D14",
+  "category": "동작",
+  "title": "flush 전 종료 (메모리 버퍼, 기본값)",
+  "expected": "미전송분 유실 — Fluent Bit 엔진 기존 동작 (stdout·기존 out_file 동일)",
+  "status": "PASS",
+  "detail": "종료 시점 기록 0/500건 → 유실 방지에는 storage.type: filesystem 필요",
+  "seconds": 2.5
+ },
+ {
+  "id": "D13",
+  "category": "동작",
+  "title": "파일 생성 지연 (flush 1초)",
+  "expected": "레코드 유입 후 약 1초 이내 파일 공개",
+  "status": "PASS",
+  "detail": "지연 1.02s, 0.70s, 0.70s, 0.69s, 0.71s",
+  "seconds": 7.4
+ },
+ {
+  "id": "E01",
+  "category": "다중 프로세스",
+  "title": "프로세스 4개 × 입력 1개가 같은 디렉토리에 기록",
+  "expected": "레코드 손실·중복·섞임 0, 이름 충돌 0",
+  "status": "PASS",
+  "detail": "파일 44개, 레코드 2,000건 정확히 1번씩, 같은 ms에 생성된 파일 1개도 충돌 없음",
+  "seconds": 1.3
+ },
+ {
+  "id": "E02",
+  "category": "다중 프로세스",
+  "title": "프로세스 8개 × 입력 2개가 같은 디렉토리에 기록",
+  "expected": "레코드 손실·중복·섞임 0, 이름 충돌 0",
+  "status": "PASS",
+  "detail": "파일 160개, 레코드 6,400건 정확히 1번씩, 같은 ms에 생성된 파일 100개도 충돌 없음",
+  "seconds": 1.4
+ },
+ {
+  "id": "E03",
+  "category": "다중 프로세스",
+  "title": "프로세스 16개 × 입력 2개가 같은 디렉토리에 기록",
+  "expected": "레코드 손실·중복·섞임 0, 이름 충돌 0",
+  "status": "PASS",
+  "detail": "파일 320개, 레코드 9,600건 정확히 1번씩, 같은 ms에 생성된 파일 188개도 충돌 없음",
+  "seconds": 1.5
+ },
+ {
+  "id": "E04",
+  "category": "다중 프로세스",
+  "title": "16개 프로세스 동시 기동 + 없는 중첩 디렉토리 mkdir",
+  "expected": "모두 기동",
+  "status": "PASS",
+  "detail": "3회 × 16개 = 48개 모두 기동",
+  "seconds": 7.8
+ },
+ {
+  "id": "E05",
+  "category": "다중 프로세스",
+  "title": "접두사가 다른 프로세스 4개가 같은 디렉토리",
+  "expected": "접두사별 분리, 서로의 tmp 정리 안 함",
+  "status": "PASS",
+  "detail": "w0 기동 시 자기 tmp만 삭제, 접두사별 파일 {'w0': 5, 'w1': 6, 'w2': 6, 'w3': 6}",
+  "seconds": 2.9
+ },
+ {
+  "id": "E06",
+  "category": "다중 프로세스",
+  "title": "SIGKILL 크래시 5회 반복 + 재시작 (3개 중 1개)",
+  "expected": "완성 파일 항상 온전, 재시작 시 tmp 정리",
+  "status": "PASS",
+  "detail": "kill -9 5회, 파일 390개 / 레코드 38,805건 전부 파싱 성공, 프로세스별 {0: 7609, 1: 15593, 2: 15603}",
+  "seconds": 15.7
+ },
+ {
+  "id": "E07",
+  "category": "다중 프로세스",
+  "title": "기록 4개 + 소비자 2개 동시 실행 (rename으로 가져가기)",
+  "expected": "소비자가 불완전 파일을 본 적 0, 레코드 정확히 1번씩",
+  "status": "PASS",
+  "detail": "소비 파일 80개 / 레코드 4,000건 정확히 1번씩, 불완전 파일 0, 소비자 간 경합(다른 쪽이 먼저 가져감) 49회",
+  "seconds": 2.2
+ }
+]
