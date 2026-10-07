@@ -43,6 +43,7 @@
 
 #include "file.h"
 #include "file_rotate.h"
+#include "file_uuid.h"
 
 #ifdef FLB_SYSTEM_WINDOWS
 #define NEWLINE "\r\n"
@@ -84,6 +85,13 @@ struct flb_file_conf {
     int rotate_max_files;
     int rotate_gzip;
     struct file_rotate_ctx *rotation;
+    /* one UUIDv7 named file per flush */
+    int uuid_file;
+    const char *uuid_file_prefix;
+    const char *uuid_file_extension;
+    int uuid_file_fsync;
+    int uuid_file_tmp_max_age;
+    struct file_uuid_ctx *uuid;
     int max_dynamic_files;
     int missing_field_action;
     int limit_reached_action;
@@ -222,6 +230,7 @@ static void file_conf_destroy(struct flb_file_conf *ctx)
     }
 
     file_rotate_destroy(ctx->rotation);
+    file_uuid_destroy(ctx->uuid);
 
     flb_free(ctx);
 }
@@ -449,6 +458,59 @@ static int resolve_dynamic_destination(struct flb_file_conf *ctx,
     return 0;
 }
 
+static int mkpath(struct flb_output_instance *ins, const char *dir);
+
+static int uuid_file_init(struct flb_file_conf *ctx)
+{
+    const char *tmp_max_age;
+
+    /*
+     * Time values are parsed with atoi(), so a typo such as 'off' would become
+     * 0 and remove the in-flight temporary files of other writers on start.
+     */
+    tmp_max_age = flb_output_get_property("uuid_file_tmp_max_age", ctx->ins);
+    if (tmp_max_age != NULL && !isdigit((unsigned char) tmp_max_age[0])) {
+        flb_plg_error(ctx->ins, "invalid uuid_file_tmp_max_age '%s', expected a time "
+                      "such as 600, 30s, 10m or 1h", tmp_max_age);
+        return -1;
+    }
+
+    if (ctx->out_file != NULL) {
+        flb_plg_error(ctx->ins, "'file' cannot be used with uuid_file");
+        return -1;
+    }
+
+    if (ctx->dynamic_destination == FLB_TRUE) {
+        flb_plg_error(ctx->ins, "record accessors in 'path' cannot be used with uuid_file");
+        return -1;
+    }
+
+    if (ctx->rotate == FLB_TRUE) {
+        flb_plg_error(ctx->ins, "'rotate' cannot be used with uuid_file");
+        return -1;
+    }
+
+    if (ctx->out_path == NULL) {
+        flb_plg_error(ctx->ins, "'path' is required when uuid_file is enabled");
+        return -1;
+    }
+
+    if (ctx->mkdir == FLB_TRUE && mkpath(ctx->ins, ctx->out_path) != 0) {
+        flb_plg_error(ctx->ins, "could not create directory %s", ctx->out_path);
+        return -1;
+    }
+
+    ctx->uuid = file_uuid_create(ctx->ins, ctx->out_path,
+                                 ctx->uuid_file_prefix,
+                                 ctx->uuid_file_extension,
+                                 ctx->uuid_file_fsync,
+                                 ctx->uuid_file_tmp_max_age);
+    if (ctx->uuid == NULL) {
+        return -1;
+    }
+
+    return 0;
+}
 
 static int cb_file_init(struct flb_output_instance *ins,
                         struct flb_config *config,
@@ -595,6 +657,11 @@ static int cb_file_init(struct flb_output_instance *ins,
     ret_str = check_delimiter(tmp);
     if (ret_str != NULL) {
         ctx->label_delimiter = ret_str;
+    }
+
+    if (ctx->uuid_file == FLB_TRUE && uuid_file_init(ctx) != 0) {
+        file_conf_destroy(ctx);
+        return -1;
     }
 
     /* Set the context */
@@ -813,6 +880,28 @@ static void print_metrics_text(struct flb_output_instance *ins,
     cmt_encode_text_destroy(text);
 }
 
+#ifndef FLB_SYSTEM_WINDOWS
+/*
+ * Create one directory level. Another process writing into the same tree may
+ * create it at the same time, which is not an error.
+ */
+static int mkdir_one(struct flb_output_instance *ins, const char *dir)
+{
+    struct stat st;
+
+    flb_plg_debug(ins, "creating directory %s", dir);
+    if (mkdir(dir, 0755) == 0) {
+        return 0;
+    }
+
+    if (errno == EEXIST && stat(dir, &st) == 0 && S_ISDIR(st.st_mode)) {
+        return 0;
+    }
+
+    return -1;
+}
+#endif
+
 static int mkpath(struct flb_output_instance *ins, const char *dir)
 {
     struct stat st;
@@ -904,8 +993,7 @@ static int mkpath(struct flb_output_instance *ins, const char *dir)
     parent_dir = dirname(dup_dir);
     if (stat(parent_dir, &st) == 0 && strncmp(parent_dir, ".", 1)) {
         if (S_ISDIR (st.st_mode)) {
-            flb_plg_debug(ins, "creating directory %s", dup_dir);
-            ret = mkdir(dup_dir, 0755);
+            ret = mkdir_one(ins, dup_dir);
             free(dup_dir);
             return ret;
         }
@@ -916,8 +1004,7 @@ static int mkpath(struct flb_output_instance *ins, const char *dir)
         free(dup_dir);
         return ret;
     }
-    flb_plg_debug(ins, "creating directory %s", dup_dir);
-    ret = mkdir(dup_dir, 0755);
+    ret = mkdir_one(ins, dup_dir);
     free(dup_dir);
     return ret;
 #else
@@ -930,8 +1017,7 @@ static int mkpath(struct flb_output_instance *ins, const char *dir)
     if (ret != 0) {
         return ret;
     }
-    flb_plg_debug(ins, "creating directory %s", dir);
-    return mkdir(dir, 0755);
+    return mkdir_one(ins, dir);
 #endif
 }
 
@@ -1105,6 +1191,164 @@ static int flush_dynamic_logs(struct flb_event_chunk *event_chunk,
     return FLB_OK;
 }
 
+/*
+ * Write a whole event chunk into 'fp' using the configured format. Returns
+ * FLB_OK, FLB_RETRY or FLB_ERROR; the caller owns and closes 'fp'.
+ */
+static int write_chunk(struct flb_file_conf *ctx, FILE *fp,
+                       struct flb_event_chunk *event_chunk,
+                       struct flb_config *config)
+{
+    int ret;
+    int column_names;
+    size_t off = 0;
+    size_t last_off = 0;
+    size_t alloc_size = 0;
+    size_t total;
+    char *buf;
+    long file_pos;
+    struct flb_log_event_decoder log_decoder;
+    struct flb_log_event log_event;
+
+    /*
+     * Get current file stream position, we gather this in case 'csv' format
+     * needs to write the column names.
+     */
+    file_pos = ftell(fp);
+
+    /* Check if the event type is metrics, handle the payload differently */
+    if (event_chunk->type == FLB_INPUT_METRICS) {
+        print_metrics_text(ctx->ins, fp,
+                           event_chunk->data, event_chunk->size);
+        return FLB_OK;
+    }
+
+    /*
+     * Msgpack output format used to create unit tests files, useful for
+     * Fluent Bit developers.
+     */
+    if (ctx->format == FLB_OUT_FILE_FMT_MSGPACK) {
+        off = 0;
+        total = 0;
+
+        do {
+            ret = fwrite((char *) event_chunk->data + off, 1,
+                         event_chunk->size - off, fp);
+            if (ret < 0) {
+                flb_errno();
+                return FLB_RETRY;
+            }
+            total += ret;
+        } while (total < event_chunk->size);
+
+        return FLB_OK;
+    }
+
+    ret = flb_log_event_decoder_init(&log_decoder,
+                                     (char *) event_chunk->data,
+                                     event_chunk->size);
+
+    if (ret != FLB_EVENT_DECODER_SUCCESS) {
+        flb_plg_error(ctx->ins,
+                      "Log event decoder initialization error : %d", ret);
+
+        return FLB_ERROR;
+    }
+
+    /*
+     * Upon flush, for each array, lookup the time and the first field
+     * of the map to use as a data point.
+     */
+    while ((ret = flb_log_event_decoder_next(
+                    &log_decoder,
+                    &log_event)) == FLB_EVENT_DECODER_SUCCESS) {
+        alloc_size = (off - last_off) + 128; /* JSON is larger than msgpack */
+        last_off = off;
+
+        switch (ctx->format){
+        case FLB_OUT_FILE_FMT_JSON:
+            buf = flb_msgpack_to_json_str(alloc_size, log_event.body,
+                                          config->json_escape_unicode);
+            if (buf) {
+                fprintf(fp, "%s: [%"PRIu64".%09lu, %s]" NEWLINE,
+                        event_chunk->tag,
+                        (uint64_t) log_event.timestamp.tm.tv_sec, log_event.timestamp.tm.tv_nsec,
+                        buf);
+                flb_free(buf);
+            }
+            else {
+                flb_log_event_decoder_destroy(&log_decoder);
+                return FLB_RETRY;
+            }
+            break;
+        case FLB_OUT_FILE_FMT_CSV:
+            if (ctx->csv_column_names == FLB_TRUE && file_pos == 0) {
+                column_names = FLB_TRUE;
+                file_pos = 1;
+            }
+            else {
+                column_names = FLB_FALSE;
+            }
+            csv_output(fp, column_names,
+                       &log_event.timestamp,
+                       log_event.body, ctx);
+            break;
+        case FLB_OUT_FILE_FMT_LTSV:
+            ltsv_output(fp,
+                        &log_event.timestamp,
+                        log_event.body, ctx);
+            break;
+        case FLB_OUT_FILE_FMT_PLAIN:
+            plain_output(fp, log_event.body, alloc_size, config->json_escape_unicode);
+
+            break;
+        case FLB_OUT_FILE_FMT_TEMPLATE:
+            template_output(fp,
+                            &log_event.timestamp,
+                            log_event.body, ctx);
+
+            break;
+        }
+    }
+
+    flb_log_event_decoder_destroy(&log_decoder);
+
+    return FLB_OK;
+}
+
+
+/*
+ * uuid_file mode: write the chunk into a new temporary file and publish it
+ * under a unique UUIDv7 name. Failures before the file is published are
+ * retried; once published the chunk is done, a retry would duplicate it.
+ */
+static int flush_uuid_file(struct flb_event_chunk *event_chunk,
+                           struct flb_file_conf *ctx,
+                           struct flb_config *config)
+{
+    int ret;
+    FILE *fp;
+    char tmp[PATH_MAX];
+
+    fp = file_uuid_open(ctx->uuid, tmp, sizeof(tmp));
+    if (fp == NULL) {
+        return FLB_RETRY;
+    }
+
+    ret = write_chunk(ctx, fp, event_chunk, config);
+    if (ret != FLB_OK) {
+        file_uuid_abort(ctx->uuid, fp, tmp);
+        return ret;
+    }
+
+    ret = file_uuid_commit(ctx->uuid, fp, tmp);
+    if (ret == FILE_UUID_FAILED) {
+        return FLB_RETRY;
+    }
+
+    return FLB_OK;
+}
+
 static void cb_file_flush(struct flb_event_chunk *event_chunk,
                           struct flb_output_flush *out_flush,
                           struct flb_input_instance *ins,
@@ -1112,16 +1356,9 @@ static void cb_file_flush(struct flb_event_chunk *event_chunk,
                           struct flb_config *config)
 {
     int ret;
-    int column_names;
     FILE * fp;
-    size_t off = 0;
-    size_t last_off = 0;
-    size_t alloc_size = 0;
-    size_t total;
     char out_file[PATH_MAX * 2];
     char sanitized_tag[PATH_MAX];
-    char *buf;
-    long file_pos;
     struct flb_file_conf *ctx = out_context;
     struct flb_log_event_decoder log_decoder;
     struct flb_log_event log_event;
@@ -1129,6 +1366,11 @@ static void cb_file_flush(struct flb_event_chunk *event_chunk,
     struct file_rotate_entry *rot_entry = NULL;
 
     (void) config;
+
+    if (ctx->uuid != NULL) {
+        ret = flush_uuid_file(event_chunk, ctx, config);
+        FLB_OUTPUT_RETURN(ret);
+    }
 
     if (ctx->dynamic_destination == FLB_TRUE &&
         event_chunk->type != FLB_INPUT_METRICS) {
@@ -1206,117 +1448,11 @@ static void cb_file_flush(struct flb_event_chunk *event_chunk,
         FLB_OUTPUT_RETURN(FLB_ERROR);
     }
 
-    /*
-     * Get current file stream position, we gather this in case 'csv' format
-     * needs to write the column names.
-     */
-    file_pos = ftell(fp);
-
-    /* Check if the event type is metrics, handle the payload differently */
-    if (event_chunk->type == FLB_INPUT_METRICS) {
-        print_metrics_text(ctx->ins, fp,
-                           event_chunk->data, event_chunk->size);
-        close_output_file(fp, rot_entry);
-        FLB_OUTPUT_RETURN(FLB_OK);
-    }
-
-    /*
-     * Msgpack output format used to create unit tests files, useful for
-     * Fluent Bit developers.
-     */
-    if (ctx->format == FLB_OUT_FILE_FMT_MSGPACK) {
-        off = 0;
-        total = 0;
-
-        do {
-            ret = fwrite((char *) event_chunk->data + off, 1,
-                         event_chunk->size - off, fp);
-            if (ret < 0) {
-                flb_errno();
-                close_output_file(fp, rot_entry);
-                FLB_OUTPUT_RETURN(FLB_RETRY);
-            }
-            total += ret;
-        } while (total < event_chunk->size);
-
-        close_output_file(fp, rot_entry);
-        FLB_OUTPUT_RETURN(FLB_OK);
-    }
-
-    ret = flb_log_event_decoder_init(&log_decoder,
-                                     (char *) event_chunk->data,
-                                     event_chunk->size);
-
-    if (ret != FLB_EVENT_DECODER_SUCCESS) {
-        flb_plg_error(ctx->ins,
-                      "Log event decoder initialization error : %d", ret);
-
-        close_output_file(fp, rot_entry);
-        FLB_OUTPUT_RETURN(FLB_ERROR);
-    }
-
-    /*
-     * Upon flush, for each array, lookup the time and the first field
-     * of the map to use as a data point.
-     */
-    while ((ret = flb_log_event_decoder_next(
-                    &log_decoder,
-                    &log_event)) == FLB_EVENT_DECODER_SUCCESS) {
-        alloc_size = (off - last_off) + 128; /* JSON is larger than msgpack */
-        last_off = off;
-
-        switch (ctx->format){
-        case FLB_OUT_FILE_FMT_JSON:
-            buf = flb_msgpack_to_json_str(alloc_size, log_event.body,
-                                          config->json_escape_unicode);
-            if (buf) {
-                fprintf(fp, "%s: [%"PRIu64".%09lu, %s]" NEWLINE,
-                        event_chunk->tag,
-                        (uint64_t) log_event.timestamp.tm.tv_sec, log_event.timestamp.tm.tv_nsec,
-                        buf);
-                flb_free(buf);
-            }
-            else {
-                flb_log_event_decoder_destroy(&log_decoder);
-                close_output_file(fp, rot_entry);
-                FLB_OUTPUT_RETURN(FLB_RETRY);
-            }
-            break;
-        case FLB_OUT_FILE_FMT_CSV:
-            if (ctx->csv_column_names == FLB_TRUE && file_pos == 0) {
-                column_names = FLB_TRUE;
-                file_pos = 1;
-            }
-            else {
-                column_names = FLB_FALSE;
-            }
-            csv_output(fp, column_names,
-                       &log_event.timestamp,
-                       log_event.body, ctx);
-            break;
-        case FLB_OUT_FILE_FMT_LTSV:
-            ltsv_output(fp,
-                        &log_event.timestamp,
-                        log_event.body, ctx);
-            break;
-        case FLB_OUT_FILE_FMT_PLAIN:
-            plain_output(fp, log_event.body, alloc_size, config->json_escape_unicode);
-
-            break;
-        case FLB_OUT_FILE_FMT_TEMPLATE:
-            template_output(fp,
-                            &log_event.timestamp,
-                            log_event.body, ctx);
-
-            break;
-        }
-    }
-
-    flb_log_event_decoder_destroy(&log_decoder);
+    ret = write_chunk(ctx, fp, event_chunk, config);
 
     close_output_file(fp, rot_entry);
 
-    FLB_OUTPUT_RETURN(FLB_OK);
+    FLB_OUTPUT_RETURN(ret);
 }
 
 static int cb_file_exit(void *data, struct flb_config *config)
@@ -1437,6 +1573,38 @@ static struct flb_config_map config_map[] = {
      FLB_CONFIG_MAP_BOOL, "rotate_gzip", "true",
      0, FLB_TRUE, offsetof(struct flb_file_conf, rotate_gzip),
      "Compress rotated files with gzip"
+    },
+
+    {
+     FLB_CONFIG_MAP_BOOL, "uuid_file", "false",
+     0, FLB_TRUE, offsetof(struct flb_file_conf, uuid_file),
+     "Write every flush into a new file named after a UUIDv7 inside 'path'. "
+     "The file is written as '<name>.tmp' and published atomically, never "
+     "replacing an existing file"
+    },
+
+    {
+     FLB_CONFIG_MAP_STR, "uuid_file_prefix", "",
+     0, FLB_TRUE, offsetof(struct flb_file_conf, uuid_file_prefix),
+     "Prefix of the file names created by uuid_file"
+    },
+
+    {
+     FLB_CONFIG_MAP_STR, "uuid_file_extension", ".log",
+     0, FLB_TRUE, offsetof(struct flb_file_conf, uuid_file_extension),
+     "Extension of the file names created by uuid_file"
+    },
+
+    {
+     FLB_CONFIG_MAP_BOOL, "uuid_file_fsync", "true",
+     0, FLB_TRUE, offsetof(struct flb_file_conf, uuid_file_fsync),
+     "fsync every uuid_file before publishing it and the directory afterwards"
+    },
+
+    {
+     FLB_CONFIG_MAP_TIME, "uuid_file_tmp_max_age", "10m",
+     0, FLB_TRUE, offsetof(struct flb_file_conf, uuid_file_tmp_max_age),
+     "On start, remove uuid_file temporary files older than this age"
     },
 
     /* EOF */

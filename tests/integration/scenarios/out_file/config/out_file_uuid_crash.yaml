@@ -1,0 +1,28 @@
+service:
+  flush: 0.2
+  grace: 2
+  log_level: info
+  http_server: on
+  http_port: ${FLUENT_BIT_HTTP_MONITORING_PORT}
+  storage.path: ${UUID_FILE_STORAGE}
+  storage.sync: full
+
+pipeline:
+  inputs:
+    - name: dummy
+      tag: app.log
+      dummy: '{"proc":"${UUID_FILE_PROC}","input":"a","message":"hello uuid_file"}'
+      rate: ${UUID_FILE_RATE}
+      samples: ${UUID_FILE_SAMPLES}
+      storage.type: filesystem
+
+  outputs:
+    - name: file
+      match: '*'
+      path: ${UUID_FILE_DIR}
+      mkdir: on
+      format: plain
+      uuid_file: on
+      uuid_file_prefix: relay-
+      uuid_file_tmp_max_age: 1s
+      retry_limit: no_limits
