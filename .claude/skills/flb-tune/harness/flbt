@@ -1,0 +1,414 @@
+#!/usr/bin/env python3
+"""flbt: Fluent Bit collector tuning harness. Usage and rules live in ../SKILL.md.
+
+  doctor                    environment, safety budget, pending intake
+  build [label]             build the working tree into a labelled binary
+  run k=v ...               one experiment, one line
+  sweep k=a,b k2=x,y ...    grid of experiments, one line each
+  max k=v ...               highest sustained rate for a config, one line
+  selftest                  prove the harness itself before trusting its numbers
+  log [n]                   last n ledger rows
+  show <id> conf|log|threads|sample
+  cmp <idA> <idB>           metric and config differences
+"""
+import collections
+import itertools
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+SKILL = os.path.dirname(HERE)
+RUNS = os.path.join(SKILL, "runs")
+ENV = os.path.join(SKILL, "env")
+LEDGER = os.path.join(RUNS, "ledger.tsv")
+IMAGE = "flbt-base:1"
+SYSTEM_KEYS = ("cpus", "mem_cap", "bin", "target", "fb_bin")
+DEFAULTS = {
+    "proto": "tcp", "fmt": "json", "size": 700, "rate": 250000, "conns": 8, "sample": "",
+    "in_workers": 1, "in_inst": 1, "threaded": "off", "procs": 1, "src_key": "",
+    "lua": "off", "lua_script": "harness/lua/enrich_sample.lua", "lua_call": "enrich",
+    "protected": "on", "meta": "collector_ip=10.0.0.1;site=dc1;pipeline=edge", "expect": "",
+    "out_workers": 2, "ack": "off", "compress": "off", "send_options": "off",
+    "delay_ms": 0, "backend": "", "flush": 1, "mem_buf_limit": "", "storage": "memory",
+    "conf": "", "warm": 3, "measure": 8, "drain": 6, "tol": 0.01,
+    "cpus": 4, "mem_cap": "2g", "bin": "base", "target": "docker", "fb_bin": "",
+}
+
+
+def die(msg, code=1):
+    print(msg)
+    sys.exit(code)
+
+
+def sh(*cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def load_profile():
+    """Flat `key: value  # comment` parser. `?` means not answered yet."""
+    prof, pending = {}, []
+    path = os.path.join(SKILL, "profile.yaml")
+    if not os.path.exists(path):
+        return prof, pending
+    for raw in open(path, encoding="utf-8"):
+        m = re.match(r"^([a-z_0-9]+):\s*(.*?)\s*(?:#.*)?$", raw)
+        if not m:
+            continue
+        key, val = m.group(1), m.group(2).strip("'\"")
+        if val == "?":
+            pending.append(key)
+        elif key in DEFAULTS:
+            prof[key] = val
+    return prof, pending
+
+
+def parse_kv(args):
+    out = {}
+    for a in args:
+        if "=" not in a:
+            die(f"bad argument {a}, expected k=v")
+        k, v = a.split("=", 1)
+        if k not in DEFAULTS and k not in ("hi", "lo"):
+            die(f"unknown key {k}. keys: {' '.join(sorted(DEFAULTS))}")
+        out[k] = v
+    return out
+
+
+def to_bytes(s):
+    m = re.match(r"^(\d+)([kmg]?)$", str(s).lower())
+    if not m:
+        die(f"bad size {s}")
+    return int(m.group(1)) * {"": 1, "k": 1 << 10, "m": 1 << 20, "g": 1 << 30}[m.group(2)]
+
+
+def parse_mem(s):
+    m = re.match(r"([\d.]+)\s*([KMGT]?)i?B", s.strip())
+    if not m:
+        return 0
+    return int(float(m.group(1)) * {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}[m.group(2)])
+
+
+def vm_budget():
+    total = sh("docker", "info", "--format", "{{.MemTotal}}").stdout.strip()
+    stats = sh("docker", "stats", "--no-stream", "--format", "{{.Name}}\t{{.MemUsage}}").stdout
+    used, names = 0, []
+    for line in stats.splitlines():
+        name, usage = line.split("\t", 1)
+        if not name.startswith("flbt-"):
+            used += parse_mem(usage.split("/")[0])
+            names.append(name)
+    return int(total or 0), used, names
+
+
+def guard(cap):
+    """The runs share a VM with the user's containers, and an uncapped run once
+    OOM-killed one of them. Every run is capped and has to fit next to them."""
+    if to_bytes(cap) <= 0:
+        die("REFUSED mem_cap must be positive")
+    total, used, _ = vm_budget()
+    if total and used + to_bytes(cap) > total * 0.9:
+        die(f"REFUSED mem_cap={cap} does not fit: used={used >> 20}M total={total >> 20}M")
+
+
+def restart_counts():
+    ids = sh("docker", "ps", "-q").stdout.split()
+    if not ids:
+        return {}
+    out = sh("docker", "inspect", "--format", "{{.Name}} {{.RestartCount}}", *ids).stdout
+    return {n.lstrip("/"): c for n, c in (x.split() for x in out.splitlines())
+            if not n.lstrip("/").startswith("flbt-")}
+
+
+def map_path(v):
+    if v.startswith("env/"):
+        return "/env/" + v[4:]
+    if v.startswith("harness/"):
+        return "/h/" + v[8:]
+    return v
+
+
+def next_id():
+    n = 0
+    if os.path.exists(LEDGER):
+        n = sum(1 for _ in open(LEDGER, encoding="utf-8"))
+    return f"r{n + 1:04d}"
+
+
+def run_one(prof, over, quiet=False):
+    job = dict(DEFAULTS)
+    job.update(prof)
+    job.update(over)
+    script = job["lua_script"]
+    if job["lua"] in ("filter", "in_proc", "out_proc") and not job["conf"] \
+            and not os.path.exists(script if script.startswith("/") else os.path.join(SKILL, script)):
+        die(f"FAIL lua_script not found: {script}")
+    rid = next_id()
+    d = os.path.join(RUNS, rid)
+    os.makedirs(d, exist_ok=True)
+    local = job["target"] == "local"
+    job["rss_limit_mb"] = int((to_bytes(job["mem_cap"]) >> 20) * 0.9)
+    if local:
+        tools = os.path.join(HERE, ".bin")
+        os.makedirs(tools, exist_ok=True)
+        for tool in ("gen", "sink"):
+            if not os.path.exists(os.path.join(tools, tool)):
+                cc = sh("cc", "-O2", "-pthread", "-o", os.path.join(tools, tool), os.path.join(HERE, tool + ".c"))
+                if cc.returncode != 0:
+                    die(f"FAIL compiling {tool}: {cc.stderr[-300:]}")
+        job.update(dir=d, tools=tools, fb=job["fb_bin"])
+        for key in ("lua_script", "sample", "conf"):
+            if job[key] and not job[key].startswith("/"):
+                job[key] = os.path.join(SKILL, job[key])
+    else:
+        job.update(dir=f"/runs/{rid}", tools="/out/tools", fb=f"/out/{job['bin']}/fluent-bit")
+        for key in ("lua_script", "sample", "conf"):
+            job[key] = map_path(job[key])
+    json.dump(job, open(os.path.join(d, "job.json"), "w"), indent=1)
+
+    if local:
+        cmd = ["python3", os.path.join(HERE, "runner.py"), os.path.join(d, "job.json")]
+    else:
+        cmd = ["docker", "run", "--rm", "--name", f"flbt-{rid}", f"--cpus={job['cpus']}",
+               f"--memory={job['mem_cap']}", f"--memory-swap={job['mem_cap']}",
+               "--add-host=host.docker.internal:host-gateway",
+               "-v", "flbt-out:/out:ro", "-v", f"{HERE}:/h:ro", "-v", f"{RUNS}:/runs",
+               "-v", f"{ENV}:/env:ro", IMAGE, "python3", "/h/runner.py", f"/runs/{rid}/job.json"]
+    before = {} if local else restart_counts()
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    lines = [x for x in p.stdout.splitlines() if x.strip()]
+    line = lines[-1] if lines else ""
+    if p.returncode != 0 or not line:
+        line = f"FAIL HARNESS rc={p.returncode} {(p.stderr or p.stdout)[-300:]!r}"
+    changed = " ".join(f"{k}={v}" for k, v in sorted(over.items()) if k not in ("hi", "lo"))
+    with open(LEDGER, "a", encoding="utf-8") as f:
+        f.write(f"{rid}\t{time.strftime('%m-%d %H:%M')}\t{job['bin']}\t{changed}\t{line}\n")
+    if not quiet:
+        print(f"{rid} [{changed or 'profile'}] {line}")
+    after = {} if local else restart_counts()
+    hit = [n for n in before if n in after and after[n] != before[n]]
+    if hit:
+        die(f"ALERT other containers restarted during {rid}: {hit}. Stop and tell the user.", 3)
+    return rid, line
+
+
+def cmd_doctor(prof, pending):
+    v = sh("docker", "version", "--format", "{{.Server.Version}}")
+    print(f"docker={'ok ' + v.stdout.strip() if v.returncode == 0 else 'UNAVAILABLE'}")
+    if v.returncode == 0:
+        total, used, names = vm_budget()
+        cpus = sh("docker", "info", "--format", "{{.NCPU}}").stdout.strip()
+        print(f"vm: cpus={cpus} mem_total={total >> 20}M used_by_others={used >> 20}M others={names}")
+        img = sh("docker", "images", "-q", IMAGE).stdout.strip()
+        print(f"image={'ok' if img else 'MISSING (run: flbt build)'}")
+        bins = sh("docker", "run", "--rm", "-v", "flbt-out:/out:ro", "debian:trixie-slim", "sh", "-c",
+                  "ls /out 2>/dev/null | grep -Ev 'tools|\\.log$' | tr '\\n' ' '").stdout.strip()
+        print(f"bins={bins or 'NONE'}")
+    print(f"intake_pending={' '.join(pending) or 'none'}")
+    if os.path.exists(LEDGER):
+        rows = open(LEDGER, encoding="utf-8").read().splitlines()
+        print(f"runs={len(rows)} last={rows[-1][:140] if rows else '-'}")
+
+
+def cmd_build(args):
+    label = args[0] if args else "base"
+    p = subprocess.run(["docker", "build", "-q", "-t", IMAGE, "-f", os.path.join(HERE, "Dockerfile"), HERE],
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        die(f"BUILD FAIL image: {p.stderr[-400:]}")
+    root = sh("git", "rev-parse", "--show-toplevel", cwd=HERE).stdout.strip()
+    listing = sh("git", "ls-files", "-z", "--cached", "--others", "--exclude-standard", cwd=root).stdout
+    names = [n for n in listing.split("\0") if n and not n.startswith(".claude/")
+             and os.path.isfile(os.path.join(root, n))]
+    env = dict(os.environ, COPYFILE_DISABLE="1")
+    pack = subprocess.Popen(["tar", "-cf", "-", "--null", "-T", "-"], cwd=root, env=env,
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    unpack = subprocess.Popen(["docker", "run", "--rm", "-i", "-v", "flbt-src:/src", IMAGE, "tar", "-xf", "-",
+                               "-C", "/src", "--warning=no-unknown-keyword"],
+                              stdin=pack.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    pack.stdout.close()
+    pack.stdin.write("\0".join(names).encode())
+    pack.stdin.close()
+    err = unpack.communicate()[1]
+    if unpack.returncode != 0:
+        die(f"BUILD FAIL sync: {err[-300:]}")
+    guard("2560m")
+    p = subprocess.run(["docker", "run", "--rm", "--name", "flbt-build", "--cpus=4", "--memory=2560m",
+                        "--memory-swap=2560m", "-v", "flbt-src:/src", "-v", "flbt-build:/build",
+                        "-v", "flbt-out:/out", "-v", f"{HERE}:/h:ro", IMAGE, "bash", "/h/build.sh", label],
+                       capture_output=True, text=True)
+    tail = (p.stdout + p.stderr).strip().splitlines()[-12:]
+    print("\n".join(tail))
+    if p.returncode != 0:
+        die(f"BUILD FAIL rc={p.returncode}", p.returncode)
+
+
+def cmd_sweep(prof, args):
+    grid = parse_kv(args)
+    keys = list(grid)
+    guard(grid.get("mem_cap", prof.get("mem_cap", DEFAULTS["mem_cap"])))
+    for combo in itertools.product(*[str(grid[k]).split(",") for k in keys]):
+        run_one(prof, dict(zip(keys, combo)))
+
+
+def cmd_max(prof, args):
+    over = parse_kv(args)
+    hi = float(over.pop("hi", 2000000))
+    lo = float(over.pop("lo", 50000))
+    guard(over.get("mem_cap", prof.get("mem_cap", DEFAULTS["mem_cap"])))
+    over.setdefault("measure", 5)
+    probes = []
+
+    def probe(rate):
+        rid, line = run_one(prof, dict(over, rate=int(rate)), quiet=True)
+        ok = line.startswith("PASS")
+        probes.append((rid, int(rate), ok, line.split("->")[-1].strip()))
+        return ok, line
+
+    rate = float(over.pop("rate", prof.get("rate", DEFAULTS["rate"])))
+    best, best_line, fail_at = 0, "", None
+    for _ in range(7):
+        ok, line = probe(rate)
+        if ok:
+            best, best_line = rate, line
+            lo = rate
+            rate = rate * 1.6 if fail_at is None else (rate + fail_at) / 2
+        else:
+            fail_at = rate
+            hi = rate
+            rate = (lo + rate) / 2
+        if rate > hi or (fail_at and (fail_at - best) / max(fail_at, 1) < 0.08):
+            break
+    limit = next((p[3] for p in reversed(probes) if not p[2]), "none")
+    print(f"MAX {int(best):,}/s limit_at_fail={limit} probes={[p[0] for p in probes]} last_pass: {best_line}")
+
+
+def cmd_selftest(prof):
+    """Fixed checks with known answers. Only system keys come from the profile."""
+    prof = {k: v for k, v in prof.items() if k in SYSTEM_KEYS}
+    base = {"rate": 50000, "conns": 4, "measure": 4}
+    fields = "collector_ip,site,pipeline"
+    checks = [
+        ("count", {}, lambda r: r["lost"] == 0 and r["sink_total"] == r["sent"] > 0),
+        ("lua-fields", {"lua": "filter", "expect": fields}, lambda r: r["fields_ok"] is True),
+        ("lua-on-engine", {"lua": "filter", "in_workers": 2, "rate": 150000},
+         lambda r: max(r["cpu"].get("eng", [0])) >= max(r["cpu"].get("wrk", [0]))),
+        ("noop-lua", {"lua": "filter", "lua_script": "harness/lua/noop.lua", "lua_call": "noop"},
+         lambda r: r["lost"] == 0),
+        ("in-proc", {"lua": "in_proc", "expect": fields}, lambda r: r["fields_ok"] is True),
+        ("out-proc", {"lua": "out_proc", "expect": fields}, lambda r: r["fields_ok"] is True),
+        ("native", {"lua": "native_filter", "expect": fields}, lambda r: r["fields_ok"] is True),
+        ("ack", {"ack": "on"}, lambda r: r["sink_acks"] > 0 and r["retries"] == 0 and r["lost"] == 0),
+        ("gzip-count", {"compress": "on"}, lambda r: r["lost"] == 0 and r["sink_unknown"] == 0),
+        ("udp", {"proto": "udp", "rate": 20000}, lambda r: r["sink_total"] > 0),
+        ("both", {"proto": "both", "rate": 20000}, lambda r: r["sink_total"] > 0),
+        ("slow-backend-detected", {"ack": "on", "delay_ms": 1500, "rate": 200000},
+         lambda r: "ok" not in r["verdict"]),
+    ]
+    failed = []
+    for name, over, check in checks:
+        rid, line = run_one(prof, dict(base, **over), quiet=True)
+        path = os.path.join(RUNS, rid, "result.json")
+        good = os.path.exists(path) and check(json.load(open(path)))
+        if not good:
+            failed.append(name)
+        print(f"{'ok  ' if good else 'FAIL'} {name} {rid}" + ("" if good else f" {line[:170]}"))
+    print(f"SELFTEST {'PASS' if not failed else 'FAIL ' + ' '.join(failed)}")
+    sys.exit(1 if failed else 0)
+
+
+def cmd_log(args):
+    n = int(args[0]) if args else 15
+    if not os.path.exists(LEDGER):
+        die("no runs yet", 0)
+    for row in open(LEDGER, encoding="utf-8").read().splitlines()[-n:]:
+        c = row.split("\t")
+        print(f"{c[0]} {c[1]} bin={c[2]} [{c[3]}] {c[4][:150]}")
+
+
+def result(rid):
+    path = os.path.join(RUNS, rid, "result.json")
+    if not os.path.exists(path):
+        die(f"no result for {rid}")
+    return json.load(open(path))
+
+
+def cmd_show(args):
+    if len(args) < 2:
+        die("usage: show <id> conf|log|threads|sample")
+    rid, what = args[0], args[1]
+    d = os.path.join(RUNS, rid)
+    if what == "conf":
+        path = os.path.join(d, "fb0.yaml")
+        print(open(path if os.path.exists(path) else os.path.join(d, "fb0.conf.txt")).read())
+    elif what == "log":
+        c = collections.Counter()
+        for name in sorted(os.listdir(d)):
+            if name.endswith(".log"):
+                for line in open(os.path.join(d, name), errors="replace"):
+                    if "[error]" in line or "[ warn]" in line:
+                        c[re.sub(r"\d+", "N", line.split("]", 1)[-1].strip())[:130]] += 1
+        for msg, n in c.most_common(10):
+            print(f"{n:>7} {msg}")
+        print({k: v for k, v in result(rid)["log"].items() if v} or "no counted errors")
+    elif what == "threads":
+        for t in sorted(result(rid)["threads"], key=lambda x: -x["cpu"])[:12]:
+            print(f"{t['role']} {t['name']} tid={t['tid']} cpu={t['cpu']}%")
+    elif what == "sample":
+        print(json.dumps(result(rid).get("sample"), ensure_ascii=False)[:1200])
+    else:
+        die("usage: show <id> conf|log|threads|sample")
+
+
+def cmd_cmp(args):
+    a, b = args[0], args[1]
+    ja, jb = [json.load(open(os.path.join(RUNS, x, "job.json"))) for x in (a, b)]
+    skip = ("dir", "fb")
+    print("config: " + (" ".join(f"{k}:{ja.get(k)}->{jb.get(k)}" for k in sorted(jb)
+                                 if k not in skip and ja.get(k) != jb.get(k)) or "same"))
+    ra, rb = result(a), result(b)
+    for k in ("sink_rate", "lost", "rss_peak", "host_busy", "udp_drop_rate", "retries"):
+        print(f"{k}: {ra[k]:.0f} -> {rb[k]:.0f}")
+    print(f"cpu: {ra['cpu']} -> {rb['cpu']}")
+    print(f"verdict: {ra['verdict']} -> {rb['verdict']}")
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv:
+        die(__doc__, 0)
+    cmd, args = argv[0], argv[1:]
+    os.makedirs(RUNS, exist_ok=True)
+    os.makedirs(ENV, exist_ok=True)
+    prof, pending = load_profile()
+    if cmd == "doctor":
+        cmd_doctor(prof, pending)
+    elif cmd == "build":
+        cmd_build(args)
+    elif cmd == "run":
+        over = parse_kv(args)
+        if prof.get("target", "docker") == "docker":
+            guard(over.get("mem_cap", prof.get("mem_cap", DEFAULTS["mem_cap"])))
+        run_one(prof, over)
+    elif cmd == "sweep":
+        cmd_sweep(prof, args)
+    elif cmd == "max":
+        cmd_max(prof, args)
+    elif cmd == "selftest":
+        guard(prof.get("mem_cap", DEFAULTS["mem_cap"]))
+        cmd_selftest(prof)
+    elif cmd == "log":
+        cmd_log(args)
+    elif cmd == "show":
+        cmd_show(args)
+    elif cmd == "cmp":
+        cmd_cmp(args)
+    else:
+        die(__doc__)
+
+
+if __name__ == "__main__":
+    main()

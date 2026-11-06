@@ -1,0 +1,54 @@
+# 실제 환경 프로파일. `flbt`의 기본값이자 Claude가 참고하는 단일 기준 파일입니다.
+# `?`는 미응답이고, `flbt doctor`의 intake_pending에 표시됩니다.
+# 평면 `key: value` 형식만 지원합니다(중첩 금지). 값에 # 을 쓸 수 없습니다.
+# 실제 IP 등이 들어가므로 이 파일을 커밋하기 전에 내용을 확인하십시오.
+
+# --- A. 수신 ---------------------------------------------------------------
+proto: tcp            # tcp | udp | both. 한 수집기가 둘 다 받으면 both, 각각 보려면 tcp와 udp도 측정합니다.
+fmt: ?                # json | none. 송신 로그가 JSON인지 평문인지
+size: 700             # 로그 1건 바이트
+rate: 250000          # 목표 초당 건수(피크 기준. 200k + 여유)
+conns: ?              # 동시 송신 연결 수(UDP는 소스 IP:포트 조합 수).
+                      # SO_REUSEPORT는 연결 단위로 분산하므로 적으면 한 워커로 쏠립니다.
+sample: ?             # 실제 로그 샘플 경로(한 줄 1건). 예: env/sample.log. 없으면 빈 값
+udp_loss_ok: ?        # UDP 유실 허용치(%). 0이면 UDP 대신 TCP 전환을 검토합니다.
+peak_vs_avg: ?        # 평균 대비 피크 비율, 버스트 지속 시간
+
+# --- B. 수집기 Lua ---------------------------------------------------------
+lua: filter           # off | filter | in_proc | out_proc | native_filter | native_proc
+lua_script: ?         # 실제 스크립트. env/ 아래에 복사한 뒤 예: env/enrich.lua
+lua_call: ?           # 호출할 Lua 함수 이름
+ip_source: ?          # 추가하는 IP가 무엇인가: sender(송신자 IP) | collector(수집기 자신의 IP)
+                      # sender면 source_address_key로, collector면 네이티브 필터로 대체 가능성이 있습니다.
+lua_external: ?       # Lua가 외부 조회(파일, DNS, 캐시 테이블)를 하는가: no | 내용
+meta: ?               # Lua가 추가하는 필드. 예: collector_ip=10.0.0.1;site=dc1
+expect: ?             # 뒷단에 도착해야 하는 필드(쉼표 구분). 예: collector_ip,site
+
+# --- C. forward 출력과 뒷단 엔진 -------------------------------------------
+backend_type: ?       # 뒷단 구현: fluentd | fluent-bit | 자체 엔진(언어, 프레임워크)
+backend: ?            # 실제 뒷단 host:port로 측정할 때만. 비우면 내장 싱크를 씁니다.
+ack: ?                # require_ack_response를 쓰는가: on | off (유실 허용 여부와 직결)
+compress: ?           # gzip 사용 여부: on | off
+backend_tls: ?        # TLS 또는 shared_key 사용 여부. 쓰면 CPU 비용이 달라집니다.
+backend_max_rate: ?   # 뒷단이 처리 가능한 초당 건수(아는 경우)
+backend_conn_limit: ? # 뒷단이 허용하는 연결 수(아는 경우)
+delay_ms: 0           # 내장 싱크의 메시지당 지연. 느린 뒷단을 모사합니다.
+
+# --- D. 버퍼와 내구성 ------------------------------------------------------
+storage: ?            # memory | filesystem
+mem_buf_limit: ?      # 예: 512M. 비우면 무제한이며, 과부하 시 OOM이 재현됐습니다.
+outage_tolerance: ?   # 뒷단 장애를 몇 분 버텨야 하는가
+
+# --- E. 운영 서버 ----------------------------------------------------------
+server_cores: ?       # 수집기 서버 코어 수와 CPU 모델
+server_mem: ?         # 메모리
+server_nic: ?         # NIC 속도
+server_kernel: ?      # 커널 버전
+prod_version: ?       # 운영 Fluent Bit 버전. in_tcp/in_udp workers가 없는 버전일 수 있습니다.
+deploy: ?             # 배포 방식: systemd | docker | k8s (프로세스 다중화 방법이 달라집니다)
+
+# --- F. 하네스 -------------------------------------------------------------
+target: docker        # docker | local (local은 Linux 서버에서 직접 실행)
+fb_bin:               # target=local일 때 fluent-bit 경로
+cpus: 4               # 컨테이너 CPU
+mem_cap: 2g           # 컨테이너 메모리 상한. 필수 안전장치이므로 끄지 마십시오.
